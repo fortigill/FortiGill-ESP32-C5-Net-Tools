@@ -7,7 +7,7 @@ web UI — no app, no cloud, no companion server required.
 **Hardware:** Waveshare ESP32-C5-Zero (4MB flash, single-core 240MHz
 RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
-**Current version:** v1.11.0
+**Current version:** v1.13.0
 
 ---
 
@@ -17,8 +17,9 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
    instructions on Windows, macOS, and Linux.
 2. **Power on the board.** On first boot (no saved WiFi credentials yet)
    it broadcasts its own WiFi access point.
-3. **Connect** your phone or laptop to that access point, then open a
-   browser to the board's address (typically `192.168.4.1`).
+3. **Connect** your phone or laptop to that access point — SSID
+   `FortiGill`, password `fortigillwins` — then open a browser to the
+   board's address (typically `192.168.4.1`).
 4. Open the **Wi-Fi Settings** tab, enter your home network's name and
    password, and save. The board reboots and joins your network.
 5. From then on, reach the web UI at `http://esp32-c5.local` or the
@@ -39,7 +40,9 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
   signal strength and channel/band info.
 
 - **Ping** — sends ICMP pings to an IP address or hostname and reports
-  round-trip times.
+  round-trip times, with an optional Continuous mode (ping until you
+  press Stop) that shows a live min/avg/max stats line and a scrolling
+  chart of reply times as they come in.
 
 - **Traceroute** — traces the hop-by-hop network path to a given IP or
   hostname.

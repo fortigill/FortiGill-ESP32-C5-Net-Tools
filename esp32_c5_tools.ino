@@ -168,12 +168,16 @@ String pingTaskResult = "";
 String pingTargetInput = "";
 int pingTtlInput = 64;
 int pingSizeInput = 64;
+bool pingContinuousMode = false;
+volatile bool pingStopRequested = false;
 
 static String pingResultLines = "";
 static uint32_t pingMinMs = 0xFFFFFFFF;
 static uint32_t pingMaxMs = 0;
 static uint64_t pingSumMs = 0;
 static volatile bool pingSessionDone = false;
+static volatile uint32_t pingReceivedCount = 0;
+static volatile uint32_t pingLastElapsedMs = 0;
 
 static void onPingSuccess(esp_ping_handle_t hdl, void *args) {
   uint16_t seqno;
@@ -193,6 +197,8 @@ static void onPingSuccess(esp_ping_handle_t hdl, void *args) {
   if (elapsedMs < pingMinMs) pingMinMs = elapsedMs;
   if (elapsedMs > pingMaxMs) pingMaxMs = elapsedMs;
   pingSumMs += elapsedMs;
+  pingReceivedCount++;
+  pingLastElapsedMs = elapsedMs;
 }
 
 static void onPingTimeout(esp_ping_handle_t hdl, void *args) {
@@ -229,6 +235,9 @@ void pingTask(void *param) {
   pingMaxMs = 0;
   pingSumMs = 0;
   pingSessionDone = false;
+  pingStopRequested = false;
+  pingReceivedCount = 0;
+  pingLastElapsedMs = 0;
 
   pingTaskResult = "Resolving " + target + "...";
 
@@ -258,7 +267,7 @@ void pingTask(void *param) {
 
   esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
   config.target_addr = targetAddr;
-  config.count = 5;
+  config.count = pingContinuousMode ? 0 : 5;  // 0 = ping indefinitely
   config.data_size = size;
   config.ttl = ttl;
   config.interval_ms = 1000;
@@ -280,9 +289,15 @@ void pingTask(void *param) {
 
   esp_ping_start(pingHdl);
 
-  unsigned long startWait = millis();
-  while (!pingSessionDone && (millis() - startWait) < 15000) {
-    delay(100);
+  if (pingContinuousMode) {
+    while (!pingStopRequested) {
+      delay(100);
+    }
+  } else {
+    unsigned long startWait = millis();
+    while (!pingSessionDone && (millis() - startWait) < 15000) {
+      delay(100);
+    }
   }
 
   esp_ping_stop(pingHdl);
@@ -1269,7 +1284,7 @@ table{color:var(--neon-dim);font-size:0.85rem;}
 th{color:var(--accent2);}
 </style></head><body>
 <h1>FortiGill ESP32-C5 Net Tools</h1>
-<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v1.11.0</div>
+<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v1.13.0</div>
 <div id="netStatusBanner" style="margin-bottom:1rem;padding:0.6rem;border:1px solid var(--border);border-radius:6px;background:var(--bg2);font-size:0.9rem;">Loading network status...</div>
 <div class="tabs">
   <div class="tab active" data-panel="sysstatus">System Status</div>
@@ -1325,7 +1340,7 @@ th{color:var(--accent2);}
 </div>
 
 <div class="panel" id="ping">
-  <p>Pings a target 5 times and reports round-trip statistics.</p>
+  <p>Pings a target 5 times and reports round-trip statistics, or continuously until stopped.</p>
   <label>Target (IP address or hostname)</label>
   <input id="pingTarget" placeholder="e.g. 8.8.8.8 or example.com">
   <label style="display:flex;align-items:center;gap:0.4rem;margin-top:0.4rem;">
@@ -1337,10 +1352,16 @@ th{color:var(--accent2);}
     <label>Packet size in bytes (0-1400)</label>
     <input id="pingSize" type="number" min="0" max="1400" value="64" style="width:100px;">
   </div>
+  <label style="display:flex;align-items:center;gap:0.4rem;margin-top:0.4rem;">
+    <input type="checkbox" id="pingContinuousToggle" style="width:auto;margin:0;"> Continuous (ping until stopped)
+  </label>
   <div style="margin-top:0.8rem;">
-    <button onclick="runPing()">Ping</button>
+    <button id="pingStartBtn" onclick="runPing()">Ping</button>
+    <button id="pingStopBtn" onclick="stopPing()" style="display:none;margin-left:0.6rem;">Stop Ping</button>
   </div>
-  <pre id="pingResult" style="margin-top:1rem;">Enter a target and press Ping.</pre>
+  <canvas id="pingChart" width="600" height="140" style="width:100%;height:140px;margin-top:0.8rem;border:1px solid var(--neon-dim);display:none;"></canvas>
+  <div id="pingStats" style="margin-top:0.8rem;font-size:0.9rem;display:none;"></div>
+  <pre id="pingResult" style="margin-top:1rem;max-height:300px;overflow-y:auto;">Enter a target and press Ping.</pre>
 </div>
 
 <div class="panel" id="traceroute">
@@ -1707,6 +1728,77 @@ const togglePingAdvanced = function(){
   const show = document.getElementById('pingAdvToggle').checked;
   document.getElementById('pingAdvFields').style.display = show ? 'block' : 'none';
 };
+let pingChartData = [];
+let pingLastSeenCount = 0;
+const pingChartMaxPoints = 60;
+const drawPingChart = function(){
+  const canvas = document.getElementById('pingChart');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (pingChartData.length < 2) return;
+
+  const leftPad = 42, rightPad = 8, topPad = 8, bottomPad = 18;
+  const plotW = w - leftPad - rightPad;
+  const plotH = h - topPad - bottomPad;
+  const n = pingChartData.length;
+  const stepX = plotW / (pingChartMaxPoints - 1);
+
+  const maxVal = Math.max.apply(null, pingChartData);
+  const minVal = Math.min.apply(null, pingChartData);
+  const range = (maxVal - minVal) || 1;
+
+  const gridColor = getComputedStyle(document.documentElement).getPropertyValue('--neon-dim').trim() || '#666';
+  const lineColor = getComputedStyle(document.documentElement).getPropertyValue('--accent2').trim() || '#4da6ff';
+
+  ctx.font = '10px monospace';
+  ctx.strokeStyle = gridColor;
+  ctx.fillStyle = gridColor;
+  ctx.lineWidth = 1;
+
+  // Y axis: gridlines + ms labels
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const frac = i / yTicks;
+    const val = maxVal - frac * range;
+    const y = topPad + frac * plotH;
+    ctx.beginPath();
+    ctx.moveTo(leftPad, y);
+    ctx.lineTo(leftPad + plotW, y);
+    ctx.stroke();
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(Math.round(val) + 'ms', leftPad - 4, y);
+  }
+
+  // X axis: tick marks + reply-number labels (roughly 1 per second)
+  const tickEvery = 10;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let i = 0; i < n; i++) {
+    if (i % tickEvery === 0 || i === n - 1) {
+      const x = leftPad + i * stepX;
+      ctx.beginPath();
+      ctx.moveTo(x, topPad + plotH);
+      ctx.lineTo(x, topPad + plotH + 4);
+      ctx.stroke();
+      const replyNum = pingLastSeenCount - (n - 1 - i);
+      ctx.fillText('#' + replyNum, x, topPad + plotH + 5);
+    }
+  }
+
+  // Data line
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  pingChartData.forEach((v, i) => {
+    const x = leftPad + i * stepX;
+    const y = topPad + plotH - ((v - minVal) / range) * plotH;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+};
+
 let pingPoll = null;
 let pingPollStarted = 0;
 const runPing = function(){
@@ -1715,11 +1807,18 @@ const runPing = function(){
   const useAdv = document.getElementById('pingAdvToggle').checked;
   const ttl = useAdv ? document.getElementById('pingTtl').value : 64;
   const size = useAdv ? document.getElementById('pingSize').value : 64;
+  const continuous = document.getElementById('pingContinuousToggle').checked;
   document.getElementById('pingResult').textContent = 'Starting ping to ' + target + '...';
-  fetch('/ping?target=' + encodeURIComponent(target) + '&ttl=' + ttl + '&size=' + size).then(r => {
+  fetch('/ping?target=' + encodeURIComponent(target) + '&ttl=' + ttl + '&size=' + size + '&continuous=' + (continuous ? '1' : '0')).then(r => {
     if (!r.ok) {
       return r.text().then(t => { throw new Error(t); });
     }
+    document.getElementById('pingStartBtn').disabled = true;
+    document.getElementById('pingStopBtn').style.display = continuous ? 'inline-block' : 'none';
+    document.getElementById('pingStats').style.display = 'none';
+    pingChartData = [];
+    pingLastSeenCount = 0;
+    document.getElementById('pingChart').style.display = 'none';
     if (pingPoll) clearInterval(pingPoll);
     pingPollStarted = Date.now();
     pingPoll = setInterval(pollPingStatus, 300);
@@ -1727,14 +1826,33 @@ const runPing = function(){
     document.getElementById('pingResult').textContent = 'Could not start ping: ' + err.message;
   });
 };
+const stopPing = function(){
+  fetch('/pingstop');
+};
 const pollPingStatus = function(){
   fetch('/pingstatus')
     .then(r=>r.json())
     .then(d=>{
       document.getElementById('pingResult').textContent = d.result;
+      document.getElementById('pingResult').scrollTop = document.getElementById('pingResult').scrollHeight;
+      if (d.count > 0) {
+        document.getElementById('pingStats').style.display = 'block';
+        document.getElementById('pingStats').textContent = 'Replies: ' + d.count + '  |  min/avg/max = ' + d.min + '/' + d.avg + '/' + d.max + ' ms';
+        if (d.count > pingLastSeenCount) {
+          pingLastSeenCount = d.count;
+          pingChartData.push(d.last);
+          if (pingChartData.length > pingChartMaxPoints) pingChartData.shift();
+          document.getElementById('pingChart').style.display = 'block';
+          drawPingChart();
+        }
+      } else {
+        document.getElementById('pingStats').style.display = 'none';
+      }
       if (!d.running) {
         clearInterval(pingPoll);
         pingPoll = null;
+        document.getElementById('pingStartBtn').disabled = false;
+        document.getElementById('pingStopBtn').style.display = 'none';
       }
     })
     .catch(() => {
@@ -1742,6 +1860,8 @@ const pollPingStatus = function(){
         clearInterval(pingPoll);
         pingPoll = null;
         document.getElementById('pingResult').textContent = 'Lost contact with the device.';
+        document.getElementById('pingStartBtn').disabled = false;
+        document.getElementById('pingStopBtn').style.display = 'none';
       }
     });
 };
@@ -2954,7 +3074,7 @@ void setup() {
     }
     WiFi.mode(WIFI_AP);
     isApMode = true;
-    WiFi.softAP("FortiGill", "fortinetwins");
+    WiFi.softAP("FortiGill", "fortigillwins");
     dnsServer.start(53, "*", WiFi.softAPIP());
     Serial.print("Setup AP IP address: ");
     Serial.println(WiFi.softAPIP());
@@ -3424,16 +3544,30 @@ void setup() {
     pingSizeInput = req->hasParam("size") ? req->getParam("size")->value().toInt() : 64;
     if (pingTtlInput < 1 || pingTtlInput > 255) pingTtlInput = 64;
     if (pingSizeInput < 0 || pingSizeInput > 1400) pingSizeInput = 64;
+    pingContinuousMode = req->hasParam("continuous") && req->getParam("continuous")->value() == "1";
+    pingStopRequested = false;
     pingTaskResult = "Starting...";
     pingTaskRunning = true;
     xTaskCreate(pingTask, "pingTask", 4096, NULL, 1, NULL);
     req->send(200, "text/plain", "started");
   });
 
+  server.on("/pingstop", HTTP_GET, [](AsyncWebServerRequest* req) {
+    pingStopRequested = true;
+    req->send(200, "text/plain", "stopping");
+  });
+
   server.on("/pingstatus", HTTP_GET, [](AsyncWebServerRequest* req) {
     String json = "{\"running\":";
     json += pingTaskRunning ? "true" : "false";
-    json += ",\"result\":\"" + jsonEscapeForWifiScan(pingTaskResult) + "\"}";
+    json += ",\"result\":\"" + jsonEscapeForWifiScan(pingTaskResult) + "\"";
+    json += ",\"count\":" + String(pingReceivedCount);
+    json += ",\"min\":" + String(pingReceivedCount > 0 ? pingMinMs : 0);
+    json += ",\"max\":" + String(pingMaxMs);
+    float avgMsNow = (pingReceivedCount > 0) ? ((float)pingSumMs / (float)pingReceivedCount) : 0.0f;
+    json += ",\"avg\":" + String(avgMsNow, 1);
+    json += ",\"last\":" + String(pingLastElapsedMs);
+    json += "}";
     req->send(200, "application/json", json);
   });
 
