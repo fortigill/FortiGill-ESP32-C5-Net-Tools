@@ -84,8 +84,8 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
 | Pattern | Meaning |
 |---|---|
-| Green, double-blinks fast every 15s | Connected to your network on 2.4GHz |
-| Blue, double-blinks fast every 15s | Connected to your network on 5GHz |
+| Green, double-blinks Green fast every 15s | Connected to your network on 2.4GHz |
+| Green, double-blinks Blue fast every 15s | Connected to your network on 5GHz |
 | Fast green blink | WiFi Scan running |
 | Fast blue blink | BLE Scan running |
 | Fast orange blink | Port Scan running |
