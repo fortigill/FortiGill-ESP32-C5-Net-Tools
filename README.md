@@ -7,7 +7,7 @@ web UI — no app, no cloud, no companion server required.
 **Hardware:** Waveshare ESP32-C5-Zero (4MB flash, single-core 240MHz
 RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
-**Current version:** v1.13.0
+**Current version:** v1.19.0
 
 ---
 
@@ -50,8 +50,34 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 - **DNS / WHOIS** — performs DNS lookups (including reverse DNS) and
   WHOIS queries against a domain or IP address.
 
-- **BLE Scan** — scans for and tracks nearby Bluetooth Low Energy
-  devices.
+- **BLE Scan** — scans for nearby Bluetooth Low Energy devices and
+  guesses what each one is from its advertised name, services, and
+  manufacturer ID (phone, earbuds, fitness tracker, generic BLE board,
+  etc.). Any device broadcasting a Remote ID signal (see below) is
+  automatically labeled as a drone rather than guessed from its name.
+
+- **Radar** — tracks a single Bluetooth device's RSSI over time by MAC
+  address, so you can walk around and use the changing signal strength
+  to help physically locate it.
+
+- **Drone Remote ID Scanner** — detects nearby drones broadcasting
+  Remote ID under the FAA's rule (ASTM F3411). Two scan modes:
+  - **Bluetooth**, with a toggle for standard range or **BLE Long
+    Range** (Coded PHY) to pick up weaker or farther-away broadcasts.
+  - **WiFi** (experimental, best-effort Beacon/NAN decoding) for the
+    smaller number of modules that broadcast Remote ID over WiFi
+    instead of BLE — most consumer drones use BLE, so try that mode
+    first.
+
+  Each detected drone shows its MAC, RSSI, FAA registration number,
+  serial number, and operator ID as they're received. Click **More
+  Info** on any drone to see everything else it broadcasts, once it
+  sends that message type: aircraft type/category/class, operational
+  status, GPS location, heading, altitude (geodetic, pressure, and
+  height above takeoff or ground level), horizontal and vertical
+  speed, the accuracy figures for all of the above, and the operator's
+  own location — with distance between the drone and its operator
+  computed automatically once both positions are known.
 
 - **Port Scan** — scans a target IP or hostname for common open TCP and
   UDP ports, grabs SSH/HTTP(S) banners where available, and guesses the
@@ -87,7 +113,8 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 | Green, double-blinks fast every 15s | Connected to your network on 2.4GHz |
 | Blue, double-blinks fast every 15s | Connected to your network on 5GHz |
 | Fast green blink | WiFi Scan running |
-| Fast blue blink | BLE Scan running |
+| Fast blue blink | BLE Scan or Radar running |
+| Fast purple blink | Drone Remote ID scan running |
 | Fast orange blink | Port Scan running |
 | Slow blue blink | In AP mode, no client connected yet |
 | Solid blue | In AP mode, a client is connected |
