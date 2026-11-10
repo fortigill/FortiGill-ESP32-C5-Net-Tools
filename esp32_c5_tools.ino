@@ -46,6 +46,41 @@ String staticDns2 = "";
 bool bleScanTaskRunning = false;
 String bleScanTaskResult = "";
 String bleScanDevicesJson = "[]";
+
+#define BLE_GENERIC_MAX_DEVICES 40
+struct BleGenericDevice {
+  String mac;
+  String name;
+  int rssi;
+  int companyId;
+  bool hasFastPair;
+  bool hasHeartRate;
+  bool hasHid;
+  bool isDrone;
+  unsigned long lastSeenMs;
+};
+BleGenericDevice bleGenericDevices[BLE_GENERIC_MAX_DEVICES];
+int bleGenericDeviceCount = 0;
+
+int bleGenericFindOrAddDevice(const String &mac) {
+  for (int i = 0; i < bleGenericDeviceCount; i++) {
+    if (bleGenericDevices[i].mac.equalsIgnoreCase(mac)) return i;
+  }
+  if (bleGenericDeviceCount < BLE_GENERIC_MAX_DEVICES) {
+    bleGenericDevices[bleGenericDeviceCount].mac = mac;
+    bleGenericDevices[bleGenericDeviceCount].name = "";
+    bleGenericDevices[bleGenericDeviceCount].rssi = 0;
+    bleGenericDevices[bleGenericDeviceCount].companyId = -1;
+    bleGenericDevices[bleGenericDeviceCount].hasFastPair = false;
+    bleGenericDevices[bleGenericDeviceCount].hasHeartRate = false;
+    bleGenericDevices[bleGenericDeviceCount].hasHid = false;
+    bleGenericDevices[bleGenericDeviceCount].isDrone = false;
+    bleGenericDevices[bleGenericDeviceCount].lastSeenMs = 0;
+    bleGenericDeviceCount++;
+    return bleGenericDeviceCount - 1;
+  }
+  return -1;
+}
 bool traceTaskRunning = false;
 String traceTaskResult = "";
 String traceTargetInput = "";
@@ -498,6 +533,18 @@ void updateStatusLed() {
       ledBlinkState = !ledBlinkState;
     }
     rgbLed.setPixelColor(0, ledBlinkState ? rgbLed.Color(0, 60, 0) : 0);  // fast blink green: scanning
+    rgbLed.show();
+    return;
+  }
+
+  extern bool ridScanActive;
+  if (ridScanActive) {
+    unsigned long now = millis();
+    if (now - lastLedBlinkMs > 100) {
+      lastLedBlinkMs = now;
+      ledBlinkState = !ledBlinkState;
+    }
+    rgbLed.setPixelColor(0, ledBlinkState ? rgbLed.Color(40, 0, 60) : 0);  // fast blink purple: drone Remote ID scanning
     rgbLed.show();
     return;
   }
@@ -1074,6 +1121,8 @@ String sysStatusTaskList() {
   list += "{\"name\":\"WHOIS\",\"running\":" + String(whoisTaskRunning ? "true" : "false") + "},";
   list += "{\"name\":\"BLE Scan\",\"running\":" + String(bleScanTaskRunning ? "true" : "false") + "},";
   list += "{\"name\":\"BLE Radar\",\"running\":" + String(radarActive ? "true" : "false") + "},";
+  extern bool ridScanActive;
+  list += "{\"name\":\"Drone RID Scan\",\"running\":" + String(ridScanActive ? "true" : "false") + "},";
   list += "{\"name\":\"Port Scan\",\"running\":" + String(portScanRunning ? "true" : "false") + "},";
   list += "{\"name\":\"Subnet Sweep\",\"running\":" + String(arpSweepRunning ? "true" : "false") + "},";
   list += "{\"name\":\"Port Sweep\",\"running\":" + String(portSweepRunning ? "true" : "false") + "}";
@@ -1246,6 +1295,490 @@ void tftpDaemonTask(void* param) {
 }
 // ===== END TFTP NETWORK DAEMON =====
 
+// ===== DRONE REMOTE ID SCANNER (Bluetooth only) =====
+#define RID_MAX_DRONES 16
+struct RidDrone {
+  String mac;
+  String serial;
+  String registration;
+  String operatorId;
+  int rssi;
+  unsigned long lastSeenMs;
+
+  // Basic ID extra
+  int uaType;
+
+  // Location / Vector message
+  int opStatus;
+  int heightType;
+  float track;
+  float hSpeed;
+  bool vSpeedValid;
+  float vSpeed;
+  bool locationValid;
+  double latitude;
+  double longitude;
+  bool altValid;
+  float altPressure;
+  float altGeodetic;
+  float height;
+  int horizAccuracy;
+  int vertAccuracy;
+  int baroAccuracy;
+  int speedAccuracy;
+  float timestamp;
+  int timestampAccuracy;
+
+  // System message
+  int classificationType;
+  int operatorLocationType;
+  bool operatorLocationValid;
+  double operatorLat;
+  double operatorLon;
+  bool areaValid;
+  int areaCount;
+  int areaRadius;
+  float areaCeiling;
+  float areaFloor;
+  int categoryEu;
+  int classEu;
+  bool operatorAltValid;
+  float operatorAltGeo;
+};
+RidDrone ridDrones[RID_MAX_DRONES];
+int ridDroneCount = 0;
+bool ridScanActive = false;
+int ridScanMode = 0;  // 0 = Bluetooth, 1 = WiFi
+TaskHandle_t ridScanTaskHandle = NULL;
+
+int ridFindOrAddDrone(const String &mac) {
+  for (int i = 0; i < ridDroneCount; i++) {
+    if (ridDrones[i].mac.equalsIgnoreCase(mac)) return i;
+  }
+  if (ridDroneCount < RID_MAX_DRONES) {
+    ridDrones[ridDroneCount].mac = mac;
+    ridDrones[ridDroneCount].serial = "";
+    ridDrones[ridDroneCount].registration = "";
+    ridDrones[ridDroneCount].operatorId = "";
+    ridDrones[ridDroneCount].rssi = 0;
+    ridDrones[ridDroneCount].lastSeenMs = 0;
+    ridDrones[ridDroneCount].uaType = -1;
+    ridDrones[ridDroneCount].opStatus = -1;
+    ridDrones[ridDroneCount].heightType = -1;
+    ridDrones[ridDroneCount].track = -1;
+    ridDrones[ridDroneCount].hSpeed = -1;
+    ridDrones[ridDroneCount].vSpeedValid = false;
+    ridDrones[ridDroneCount].vSpeed = 0;
+    ridDrones[ridDroneCount].locationValid = false;
+    ridDrones[ridDroneCount].latitude = 0;
+    ridDrones[ridDroneCount].longitude = 0;
+    ridDrones[ridDroneCount].altValid = false;
+    ridDrones[ridDroneCount].altPressure = 0;
+    ridDrones[ridDroneCount].altGeodetic = 0;
+    ridDrones[ridDroneCount].height = 0;
+    ridDrones[ridDroneCount].horizAccuracy = -1;
+    ridDrones[ridDroneCount].vertAccuracy = -1;
+    ridDrones[ridDroneCount].baroAccuracy = -1;
+    ridDrones[ridDroneCount].speedAccuracy = -1;
+    ridDrones[ridDroneCount].timestamp = -1;
+    ridDrones[ridDroneCount].timestampAccuracy = -1;
+    ridDrones[ridDroneCount].classificationType = -1;
+    ridDrones[ridDroneCount].operatorLocationType = -1;
+    ridDrones[ridDroneCount].operatorLocationValid = false;
+    ridDrones[ridDroneCount].operatorLat = 0;
+    ridDrones[ridDroneCount].operatorLon = 0;
+    ridDrones[ridDroneCount].areaValid = false;
+    ridDrones[ridDroneCount].areaCount = -1;
+    ridDrones[ridDroneCount].areaRadius = -1;
+    ridDrones[ridDroneCount].areaCeiling = 0;
+    ridDrones[ridDroneCount].areaFloor = 0;
+    ridDrones[ridDroneCount].categoryEu = -1;
+    ridDrones[ridDroneCount].classEu = -1;
+    ridDrones[ridDroneCount].operatorAltValid = false;
+    ridDrones[ridDroneCount].operatorAltGeo = 0;
+    ridDroneCount++;
+    return ridDroneCount - 1;
+  }
+  return -1;
+}
+
+static int32_t ridReadI32LE(const String &d, int off) {
+  uint32_t v = (uint32_t)(uint8_t)d[off] | ((uint32_t)(uint8_t)d[off + 1] << 8) |
+               ((uint32_t)(uint8_t)d[off + 2] << 16) | ((uint32_t)(uint8_t)d[off + 3] << 24);
+  return (int32_t)v;
+}
+static uint16_t ridReadU16LE(const String &d, int off) {
+  return (uint16_t)((uint8_t)d[off] | ((uint16_t)(uint8_t)d[off + 1] << 8));
+}
+
+bool ridParseMessagePack(const String &mac, int rssi, const String &packData) {
+  int len = packData.length();
+  if (len < 2) return false;
+  uint8_t packHeader = (uint8_t)packData[0];
+  uint8_t packType = (packHeader >> 4) & 0x0F;
+
+  int msgSize = 25;
+  int numMessages = 1;
+  int msgStart = 0;
+  int offset = 0;
+
+  if (packType == 0x0F) {
+    offset++;
+    if (offset + 1 >= len) return false;
+    msgSize = (uint8_t)packData[offset];
+    numMessages = (uint8_t)packData[offset + 1];
+    offset += 2;
+    msgStart = offset;
+  }
+  if (msgSize <= 0 || msgSize > 64) msgSize = 25;  // sanity fallback
+
+  int droneIdx = ridFindOrAddDrone(mac);
+  if (droneIdx < 0) return false;
+  ridDrones[droneIdx].rssi = rssi;
+  ridDrones[droneIdx].lastSeenMs = millis();
+
+  bool gotSomething = false;
+  for (int m = 0; m < numMessages; m++) {
+    int base = msgStart + m * msgSize;
+    if (base + 2 > len) break;
+    uint8_t msgHeader = (uint8_t)packData[base];
+    uint8_t msgType = (msgHeader >> 4) & 0x0F;
+    if (msgType == 0x0) {  // Basic ID message
+      uint8_t idTypeByte = (uint8_t)packData[base + 1];
+      uint8_t idType = (idTypeByte >> 4) & 0x0F;
+      ridDrones[droneIdx].uaType = (int)(idTypeByte & 0x0F);
+      String idStr = "";
+      for (int c = 0; c < 20 && (base + 2 + c) < len; c++) {
+        char ch = packData[base + 2 + c];
+        if (ch == 0) break;
+        idStr += ch;
+      }
+      idStr.trim();
+      if (idType == 1 && idStr.length() > 0) {
+        ridDrones[droneIdx].serial = idStr;
+        gotSomething = true;
+      } else if (idType == 2 && idStr.length() > 0) {
+        ridDrones[droneIdx].registration = idStr;
+        gotSomething = true;
+      }
+    } else if (msgType == 0x5) {  // Operator ID message
+      String opStr = "";
+      for (int c = 0; c < 20 && (base + 2 + c) < len; c++) {
+        char ch = packData[base + 2 + c];
+        if (ch == 0) break;
+        opStr += ch;
+      }
+      opStr.trim();
+      if (opStr.length() > 0) {
+        ridDrones[droneIdx].operatorId = opStr;
+        gotSomething = true;
+      }
+    } else if (msgType == 0x1 && base + 25 <= len) {  // Location/Vector message
+      uint8_t statusByte = (uint8_t)packData[base + 1];
+      ridDrones[droneIdx].opStatus = (statusByte >> 4) & 0x0F;
+      ridDrones[droneIdx].heightType = (statusByte >> 2) & 0x01;
+      uint8_t ewDir = (statusByte >> 1) & 0x01;
+      uint8_t speedMult = statusByte & 0x01;
+
+      uint8_t trackRaw = (uint8_t)packData[base + 2];
+      ridDrones[droneIdx].track = ewDir ? ((float)trackRaw + 180.0f) : (float)trackRaw;
+
+      uint8_t speedRaw = (uint8_t)packData[base + 3];
+      if (speedRaw != 255) {
+        ridDrones[droneIdx].hSpeed = speedMult ? ((float)speedRaw * 0.75f + 63.75f) : ((float)speedRaw * 0.25f);
+      }
+
+      int8_t vSpeedRaw = (int8_t)packData[base + 4];
+      if (vSpeedRaw != 127 && vSpeedRaw != -128) {
+        ridDrones[droneIdx].vSpeed = (float)vSpeedRaw * 0.5f;
+        ridDrones[droneIdx].vSpeedValid = true;
+      }
+
+      int32_t latRaw = ridReadI32LE(packData, base + 5);
+      int32_t lonRaw = ridReadI32LE(packData, base + 9);
+      if (latRaw != 0 || lonRaw != 0) {
+        ridDrones[droneIdx].latitude = (double)latRaw / 1e7;
+        ridDrones[droneIdx].longitude = (double)lonRaw / 1e7;
+        ridDrones[droneIdx].locationValid = true;
+      }
+
+      uint16_t pressAltRaw = ridReadU16LE(packData, base + 13);
+      uint16_t geoAltRaw = ridReadU16LE(packData, base + 15);
+      uint16_t heightRaw = ridReadU16LE(packData, base + 17);
+      if (pressAltRaw != 0xFFFF) ridDrones[droneIdx].altPressure = (float)pressAltRaw * 0.5f - 1000.0f;
+      if (geoAltRaw != 0xFFFF) ridDrones[droneIdx].altGeodetic = (float)geoAltRaw * 0.5f - 1000.0f;
+      if (heightRaw != 0xFFFF) ridDrones[droneIdx].height = (float)heightRaw * 0.5f - 1000.0f;
+      if (pressAltRaw != 0xFFFF || geoAltRaw != 0xFFFF || heightRaw != 0xFFFF) {
+        ridDrones[droneIdx].altValid = true;
+      }
+
+      uint8_t accByte1 = (uint8_t)packData[base + 19];
+      ridDrones[droneIdx].horizAccuracy = accByte1 & 0x0F;
+      ridDrones[droneIdx].vertAccuracy = (accByte1 >> 4) & 0x0F;
+
+      uint8_t accByte2 = (uint8_t)packData[base + 20];
+      ridDrones[droneIdx].speedAccuracy = accByte2 & 0x0F;
+      ridDrones[droneIdx].baroAccuracy = (accByte2 >> 4) & 0x0F;
+
+      uint16_t tsRaw = ridReadU16LE(packData, base + 21);
+      if (tsRaw != 0xFFFF) ridDrones[droneIdx].timestamp = (float)tsRaw / 10.0f;
+
+      uint8_t tsAccByte = (uint8_t)packData[base + 23];
+      ridDrones[droneIdx].timestampAccuracy = tsAccByte & 0x0F;
+
+      gotSomething = true;
+    } else if (msgType == 0x4 && base + 25 <= len) {  // System message
+      uint8_t flagsByte = (uint8_t)packData[base + 1];
+      ridDrones[droneIdx].classificationType = (flagsByte >> 2) & 0x07;
+      ridDrones[droneIdx].operatorLocationType = flagsByte & 0x03;
+
+      int32_t opLatRaw = ridReadI32LE(packData, base + 2);
+      int32_t opLonRaw = ridReadI32LE(packData, base + 6);
+      if (opLatRaw != 0 || opLonRaw != 0) {
+        ridDrones[droneIdx].operatorLat = (double)opLatRaw / 1e7;
+        ridDrones[droneIdx].operatorLon = (double)opLonRaw / 1e7;
+        ridDrones[droneIdx].operatorLocationValid = true;
+      }
+
+      uint16_t areaCountRaw = ridReadU16LE(packData, base + 10);
+      uint8_t areaRadiusRaw = (uint8_t)packData[base + 12];
+      uint16_t areaCeilRaw = ridReadU16LE(packData, base + 13);
+      uint16_t areaFloorRaw = ridReadU16LE(packData, base + 15);
+      ridDrones[droneIdx].areaCount = areaCountRaw;
+      ridDrones[droneIdx].areaRadius = areaRadiusRaw * 10;
+      if (areaCeilRaw != 0xFFFF) ridDrones[droneIdx].areaCeiling = (float)areaCeilRaw * 0.5f - 1000.0f;
+      if (areaFloorRaw != 0xFFFF) ridDrones[droneIdx].areaFloor = (float)areaFloorRaw * 0.5f - 1000.0f;
+      ridDrones[droneIdx].areaValid = true;
+
+      uint8_t classByte = (uint8_t)packData[base + 17];
+      ridDrones[droneIdx].categoryEu = (classByte >> 4) & 0x0F;
+      ridDrones[droneIdx].classEu = classByte & 0x0F;
+
+      uint16_t opAltRaw = ridReadU16LE(packData, base + 18);
+      if (opAltRaw != 0xFFFF) {
+        ridDrones[droneIdx].operatorAltGeo = (float)opAltRaw * 0.5f - 1000.0f;
+        ridDrones[droneIdx].operatorAltValid = true;
+      }
+
+      gotSomething = true;
+    }
+  }
+  return gotSomething;
+}
+
+void ridParseServiceData(const String &mac, int rssi, const String &svcData) {
+  int len = svcData.length();
+  if (len < 2) return;
+  uint8_t appCode = (uint8_t)svcData[0];
+  if (appCode != 0x0D) return;  // not ASTM Remote ID application code
+  // svcData[1] is an undocumented message-counter byte this device inserts
+  // between the App Code and the real pack/message header -- skip it too.
+  ridParseMessagePack(mac, rssi, svcData.substring(2));
+}
+
+String ridBuildJson() {
+  String json = "[";
+  unsigned long now = millis();
+  for (int i = 0; i < ridDroneCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"mac\":\"" + ridDrones[i].mac + "\"";
+    json += ",\"serial\":\"" + jsonEscapeForWifiScan(ridDrones[i].serial) + "\"";
+    json += ",\"registration\":\"" + jsonEscapeForWifiScan(ridDrones[i].registration) + "\"";
+    json += ",\"operatorId\":\"" + jsonEscapeForWifiScan(ridDrones[i].operatorId) + "\"";
+    json += ",\"rssi\":" + String(ridDrones[i].rssi);
+    json += ",\"agoMs\":" + String(now - ridDrones[i].lastSeenMs);
+    json += ",\"uaType\":" + String(ridDrones[i].uaType);
+    json += ",\"opStatus\":" + String(ridDrones[i].opStatus);
+    json += ",\"heightType\":" + String(ridDrones[i].heightType);
+    json += ",\"track\":" + String(ridDrones[i].track, 1);
+    json += ",\"hSpeed\":" + String(ridDrones[i].hSpeed, 2);
+    json += ",\"vSpeedValid\":" + String(ridDrones[i].vSpeedValid ? "true" : "false");
+    json += ",\"vSpeed\":" + String(ridDrones[i].vSpeed, 2);
+    json += ",\"locationValid\":" + String(ridDrones[i].locationValid ? "true" : "false");
+    json += ",\"lat\":" + String(ridDrones[i].latitude, 7);
+    json += ",\"lon\":" + String(ridDrones[i].longitude, 7);
+    json += ",\"altValid\":" + String(ridDrones[i].altValid ? "true" : "false");
+    json += ",\"altPressure\":" + String(ridDrones[i].altPressure, 1);
+    json += ",\"altGeodetic\":" + String(ridDrones[i].altGeodetic, 1);
+    json += ",\"height\":" + String(ridDrones[i].height, 1);
+    json += ",\"horizAcc\":" + String(ridDrones[i].horizAccuracy);
+    json += ",\"vertAcc\":" + String(ridDrones[i].vertAccuracy);
+    json += ",\"baroAcc\":" + String(ridDrones[i].baroAccuracy);
+    json += ",\"speedAcc\":" + String(ridDrones[i].speedAccuracy);
+    json += ",\"timestampAcc\":" + String(ridDrones[i].timestampAccuracy);
+    json += ",\"classType\":" + String(ridDrones[i].classificationType);
+    json += ",\"opLocType\":" + String(ridDrones[i].operatorLocationType);
+    json += ",\"opLocValid\":" + String(ridDrones[i].operatorLocationValid ? "true" : "false");
+    json += ",\"opLat\":" + String(ridDrones[i].operatorLat, 7);
+    json += ",\"opLon\":" + String(ridDrones[i].operatorLon, 7);
+    json += ",\"categoryEu\":" + String(ridDrones[i].categoryEu);
+    json += ",\"classEu\":" + String(ridDrones[i].classEu);
+    json += "}";
+  }
+  json += "]";
+  return json;
+}
+
+String ridBytesToHex(const String &data) {
+  String hex = "";
+  for (int i = 0; i < data.length(); i++) {
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%02X ", (uint8_t)data[i]);
+    hex += buf;
+  }
+  return hex;
+}
+
+static int ridGapExtDiscHandler(struct ble_gap_event *event, void *arg) {
+  if (event->type != BLE_GAP_EVENT_EXT_DISC) {
+    return 0;
+  }
+  const struct ble_gap_ext_disc_desc &d = event->ext_disc;
+
+  char macBuf[18];
+  snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           d.addr.val[5], d.addr.val[4], d.addr.val[3],
+           d.addr.val[2], d.addr.val[1], d.addr.val[0]);
+  String mac = String(macBuf);
+
+  Serial.print("[RID ext debug] " + mac + " rssi=" + String(d.rssi) + " phy=" + String(d.prim_phy) + "/" + String(d.sec_phy) + " data=[");
+  for (int k = 0; k < d.length_data; k++) {
+    char hb[4];
+    snprintf(hb, sizeof(hb), "%02X ", d.data[k]);
+    Serial.print(hb);
+  }
+  Serial.println("]");
+
+  int i = 0;
+  while (i < d.length_data) {
+    uint8_t adLen = d.data[i];
+    if (adLen == 0) break;
+    if (i + 1 + adLen > d.length_data) break;
+    uint8_t adType = d.data[i + 1];
+    if (adType == 0x16 && adLen >= 3) {
+      uint16_t uuid = d.data[i + 2] | (d.data[i + 3] << 8);
+      if (uuid == 0xFFFA) {
+        String svcData = "";
+        for (int k = 0; k < adLen - 3; k++) {
+          svcData += (char)d.data[i + 4 + k];
+        }
+        ridParseServiceData(mac, (int)d.rssi, svcData);
+      }
+    }
+    i += 1 + adLen;
+  }
+  return 0;
+}
+
+#include "esp_wifi.h"
+
+TaskHandle_t wifiRidScanTaskHandle = NULL;
+
+void wifiRidPromiscCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
+  if (!ridScanActive) return;
+  if (type != WIFI_PKT_MGMT) return;
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+  const uint8_t *payload = pkt->payload;
+  int len = pkt->rx_ctrl.sig_len;
+  if (len < 24) return;
+  uint8_t fcByte0 = payload[0];
+  int rssi = pkt->rx_ctrl.rssi;
+
+  char macBuf[18];
+  snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           payload[10], payload[11], payload[12], payload[13], payload[14], payload[15]);
+  String mac = String(macBuf);
+
+  if (fcByte0 == 0x80) {
+    // Beacon frame: look for the Vendor Specific IE (tag 0xDD) carrying
+    // OUI FA:0B:BC, vendor type 0x0D (ASTM/Open Drone ID WiFi Beacon).
+    int pos = 36;  // past the 24-byte mgmt header + 12-byte fixed beacon params
+    while (pos + 2 <= len) {
+      uint8_t tagId = payload[pos];
+      uint8_t tagLen = payload[pos + 1];
+      if (pos + 2 + tagLen > len) break;
+      if (tagId == 0xDD && tagLen >= 4 &&
+          payload[pos + 2] == 0xFA && payload[pos + 3] == 0x0B && payload[pos + 4] == 0xBC &&
+          payload[pos + 5] == 0x0D) {
+        int packDataLen = tagLen - 4;
+        const uint8_t *packData = payload + pos + 6;
+        // Internal header layout before the message pack isn't confirmed,
+        // so try a small window of offsets and accept whichever decodes.
+        for (int tryOffset = 0; tryOffset <= 12 && tryOffset < packDataLen; tryOffset++) {
+          String chunk = "";
+          for (int k = tryOffset; k < packDataLen; k++) chunk += (char)packData[k];
+          if (ridParseMessagePack(mac, rssi, chunk)) break;
+        }
+      }
+      pos += 2 + tagLen;
+    }
+  } else if (fcByte0 == 0xD0) {
+    // Public Action frame: WiFi NAN Service Descriptor carrying the ODID
+    // message pack. Offsets per the documented NAN action-frame layout.
+    if (len < 44) return;
+    if (payload[24] != 0x04 || payload[25] != 0x09) return;       // category / action code
+    if (payload[26] != 0x50 || payload[27] != 0x6F || payload[28] != 0x9A) return;  // WFA OUI
+    if (payload[29] != 0x13) return;                               // OUI type
+    if (payload[30] != 0x03) return;                               // Service Descriptor attribute
+    static const uint8_t odidServiceId[6] = {0x88, 0x69, 0x19, 0x9D, 0x92, 0x09};
+    bool svcMatch = true;
+    for (int k = 0; k < 6; k++) {
+      if (payload[33 + k] != odidServiceId[k]) { svcMatch = false; break; }
+    }
+    if (!svcMatch) return;
+    int packDataLen = len - 44;
+    String chunk = "";
+    for (int k = 0; k < packDataLen; k++) chunk += (char)payload[44 + k];
+    ridParseMessagePack(mac, rssi, chunk);
+  }
+}
+
+void wifiRidScanTask(void *param) {
+  esp_wifi_set_promiscuous_rx_cb(&wifiRidPromiscCallback);
+  esp_wifi_set_promiscuous(true);
+  const uint8_t ridWifiChannels[] = {1, 6, 11};
+  int ridWifiChIdx = 0;
+  while (ridScanActive) {
+    esp_wifi_set_channel(ridWifiChannels[ridWifiChIdx], WIFI_SECOND_CHAN_NONE);
+    ridWifiChIdx = (ridWifiChIdx + 1) % 3;
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+  esp_wifi_set_promiscuous(false);
+  wifiRidScanTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+
+void ridScanTask(void *param) {
+  BLEScan *pBLEScan = BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(80);
+  pBLEScan->setWindow(60);
+
+  struct ble_gap_ext_disc_params ridUncodedParams = {};
+  ridUncodedParams.itvl = 64;
+  ridUncodedParams.window = 64;
+  ridUncodedParams.passive = 0;
+  ridUncodedParams.disable_observer_mode = 0;
+
+  struct ble_gap_ext_disc_params ridCodedParams = ridUncodedParams;
+
+  int ridDiscRc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                                    BLE_HCI_SCAN_FILT_NO_WL, 0,
+                                    &ridUncodedParams, &ridCodedParams,
+                                    ridGapExtDiscHandler, NULL);
+  if (ridDiscRc != 0) {
+    Serial.println("[RID debug] ble_gap_ext_disc() failed, rc=" + String(ridDiscRc));
+  }
+
+  while (ridScanActive) {
+    delay(200);
+  }
+  ble_gap_disc_cancel();
+  ridScanTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+// ===== END DRONE REMOTE ID SCANNER =====
+
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><title>FortiGill ESP32-C5 Net Tools</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1284,7 +1817,7 @@ table{color:var(--neon-dim);font-size:0.85rem;}
 th{color:var(--accent2);}
 </style></head><body>
 <h1>FortiGill ESP32-C5 Net Tools</h1>
-<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v1.13.0</div>
+<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v1.19.0</div>
 <div id="netStatusBanner" style="margin-bottom:1rem;padding:0.6rem;border:1px solid var(--border);border-radius:6px;background:var(--bg2);font-size:0.9rem;">Loading network status...</div>
 <div class="tabs">
   <div class="tab active" data-panel="sysstatus">System Status</div>
@@ -1299,6 +1832,7 @@ th{color:var(--accent2);}
   <div class="tab" data-panel="netsettings">Network Settings</div>
   <div class="tab" data-panel="ledctl">LED</div>
   <div class="tab" data-panel="tftpserver">TFTP Server</div>
+  <div class="tab" data-panel="dronerid">Drone RID</div>
 </div>
 
 <div class="panel active" id="sysstatus">
@@ -1523,6 +2057,18 @@ th{color:var(--accent2);}
   <button onclick="stopTftpDaemon()" style="margin-left:0.6rem;">Stop Daemon</button>
 </div>
 
+<div class="panel" id="dronerid">
+  <p>Scans for nearby drones broadcasting Remote ID (ASTM F3411). Bluetooth mode covers Legacy and Long Range advertising; WiFi mode covers Beacon and NAN broadcasts (best-effort decoding, hops channels 1/6/11 &mdash; may briefly interrupt this device's own AP while scanning). Shows each drone's MAC address, FAA registration number, and serial number as they're received.</p>
+  <div style="margin-bottom:0.5rem;">
+    <label><input type="radio" name="ridMode" value="ble" checked> Bluetooth</label>
+    <label style="margin-left:1rem;"><input type="radio" name="ridMode" value="wifi"> WiFi (Beacon/NAN)</label>
+  </div>
+  <div id="ridScanStatus" style="margin-bottom:0.5rem;">Scan stopped.</div>
+  <button id="ridStartBtn" onclick="startRidScan()">Start Scan</button>
+  <button id="ridStopBtn" onclick="stopRidScan()" style="display:none;margin-left:0.6rem;">Stop Scan</button>
+  <div id="ridDroneList" style="margin-top:1rem;font-size:0.9rem;">No drones detected yet.</div>
+</div>
+
 <script>
 let sysStatusPoll = null;
 const startSysStatusMonitoring = function(){
@@ -1645,6 +2191,116 @@ const startTftpDaemon = function(){
 };
 const stopTftpDaemon = function(){
   fetch('/tftpdaemonstop').then(() => pollTftpDaemonStatus());
+};
+
+let ridPoll = null;
+const startRidScan = function(){
+  const modeEl = document.querySelector('input[name="ridMode"]:checked');
+  const mode = modeEl ? modeEl.value : 'ble';
+  fetch('/ridscanstart?mode=' + mode).then(() => {
+    document.getElementById('ridStartBtn').style.display = 'none';
+    document.getElementById('ridStopBtn').style.display = 'inline-block';
+    document.getElementById('ridScanStatus').textContent = 'Scanning for Remote ID broadcasts (' + (mode === 'wifi' ? 'WiFi' : 'Bluetooth') + ')...';
+    if (ridPoll) clearInterval(ridPoll);
+    ridPoll = setInterval(pollRidScan, 1000);
+    pollRidScan();
+  });
+};
+const stopRidScan = function(){
+  fetch('/ridscanstop').then(() => {
+    document.getElementById('ridStartBtn').style.display = 'inline-block';
+    document.getElementById('ridStopBtn').style.display = 'none';
+    document.getElementById('ridScanStatus').textContent = 'Scan stopped.';
+    if (ridPoll) { clearInterval(ridPoll); ridPoll = null; }
+  });
+};
+let ridLastData = null;
+const ridExpandedMacs = new Set();
+function ridToggleMoreInfo(mac) {
+  if (ridExpandedMacs.has(mac)) ridExpandedMacs.delete(mac); else ridExpandedMacs.add(mac);
+  if (ridLastData) ridRenderDroneList(ridLastData);
+}
+const RID_UA_TYPE = ['None','Aeroplane','Helicopter/Multirotor','Gyroplane','Hybrid Lift','Ornithopter','Glider','Kite','Free Balloon','Captive Balloon','Airship','Free Fall/Parachute','Rocket','Tethered Powered Aircraft','Ground Obstacle','Other'];
+const RID_OP_STATUS = ['Undeclared','Ground','Airborne','Emergency','Remote ID System Failure'];
+const RID_HEIGHT_TYPE = ['Above Takeoff','Above Ground Level'];
+const RID_HOR_ACC = ['Unknown','<18.52km (10NM)','<7.408km (4NM)','<3.704km (2NM)','<1852m (1NM)','<926m (0.5NM)','<555.6m (0.3NM)','<185.2m (0.1NM)','<92.6m (0.05NM)','<30m','<10m','<3m','<1m'];
+const RID_VER_ACC = ['Unknown/>=150m','<150m','<45m','<25m','<10m','<3m','<1m'];
+const RID_SPEED_ACC = ['Unknown/>=10m/s','<10m/s','<3m/s','<1m/s','<0.3m/s'];
+const RID_CLASS_TYPE = ['Undeclared','European Union'];
+const RID_OP_LOC_TYPE = ['Takeoff Location','Live GNSS','Fixed Location'];
+const RID_CATEGORY_EU = ['Undeclared','Open','Specific','Certified'];
+const RID_CLASS_EU = ['Undeclared','Class 0','Class 1','Class 2','Class 3','Class 4','Class 5','Class 6'];
+function ridLookup(arr, idx) {
+  if (idx === undefined || idx === null || idx < 0 || idx >= arr.length) return '(not received yet)';
+  return arr[idx];
+}
+function ridHaversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)*Math.sin(dLon/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+function ridRenderDroneList(d) {
+  const listDiv = document.getElementById('ridDroneList');
+  if (!d.drones || d.drones.length === 0) {
+    listDiv.textContent = 'No drones detected yet.';
+    return;
+  }
+  let html = '';
+  d.drones.forEach(dr => {
+    const agoSec = Math.round(dr.agoMs / 1000);
+    const expanded = ridExpandedMacs.has(dr.mac);
+    const isEu = dr.classType === 1;
+    html += '<div style="margin-bottom:0.6rem;padding:0.4rem;border:1px solid var(--neon-dim);">';
+    html += '<b>MAC:</b> ' + dr.mac + '  (RSSI ' + dr.rssi + ' dBm, seen ' + agoSec + 's ago)<br>';
+    html += '<b>FAA Registration:</b> ' + (dr.registration || '(not received yet)') + '<br>';
+    html += '<b>Serial Number:</b> ' + (dr.serial || '(not received yet)') + '<br>';
+    html += '<b>Operator ID:</b> ' + (dr.operatorId || '(not received yet)') + '<br>';
+    html += '<button onclick="ridToggleMoreInfo(\'' + dr.mac + '\')" style="margin-top:0.3rem;">' + (expanded ? 'Hide Info &#9650;' : 'More Info &#9660;') + '</button>';
+    if (expanded) {
+      html += '<div style="margin-top:0.5rem;padding-top:0.4rem;border-top:1px dashed var(--neon-dim);">';
+      html += '<u>Aircraft</u><br>';
+      html += '<b>Manufacturer:</b> (not part of Remote ID broadcast)<br>';
+      html += '<b>Model:</b> (not part of Remote ID broadcast)<br>';
+      html += '<b>Type:</b> ' + ridLookup(RID_UA_TYPE, dr.uaType) + '<br>';
+      html += '<b>Category (EU):</b> ' + (isEu ? ridLookup(RID_CATEGORY_EU, dr.categoryEu) : 'N/A (not EU-classified)') + '<br>';
+      html += '<b>Class (EU):</b> ' + (isEu ? ridLookup(RID_CLASS_EU, dr.classEu) : 'N/A (not EU-classified)') + '<br>';
+      html += '<br><u>Operational State</u><br>';
+      html += '<b>Status:</b> ' + ridLookup(RID_OP_STATUS, dr.opStatus) + '<br>';
+      html += '<b>Location:</b> ' + (dr.locationValid ? (dr.lat.toFixed(7) + ', ' + dr.lon.toFixed(7)) : '(not received yet)') + '<br>';
+      html += '<b>Horizontal Accuracy:</b> ' + ridLookup(RID_HOR_ACC, dr.horizAcc) + '<br>';
+      html += '<b>Vertical Accuracy:</b> ' + ridLookup(RID_VER_ACC, dr.vertAcc) + '<br>';
+      html += '<b>Heading/Track:</b> ' + (dr.track >= 0 ? dr.track.toFixed(0) + '&deg;' : '(not received yet)') + '<br>';
+      html += '<b>Distance from Operator:</b> ' + ((dr.locationValid && dr.opLocValid) ? ridHaversineMeters(dr.lat, dr.lon, dr.opLat, dr.opLon).toFixed(0) + ' m' : '(not received yet)') + '<br>';
+      html += '<b>Height:</b> ' + (dr.altValid ? (dr.height.toFixed(1) + ' m (' + ridLookup(RID_HEIGHT_TYPE, dr.heightType) + ')') : '(not received yet)') + '<br>';
+      html += '<b>Altitude (Geodetic):</b> ' + (dr.altValid ? dr.altGeodetic.toFixed(1) + ' m' : '(not received yet)') + '<br>';
+      html += '<b>Altitude (Pressure):</b> ' + (dr.altValid ? dr.altPressure.toFixed(1) + ' m' : '(not received yet)') + '<br>';
+      html += '<b>Barometric Accuracy:</b> ' + ridLookup(RID_VER_ACC, dr.baroAcc) + '<br>';
+      html += '<br><u>Speed</u><br>';
+      html += '<b>Horizontal Speed:</b> ' + (dr.hSpeed >= 0 ? dr.hSpeed.toFixed(2) + ' m/s' : '(not received yet)') + '<br>';
+      html += '<b>Vertical Speed:</b> ' + (dr.vSpeedValid ? dr.vSpeed.toFixed(2) + ' m/s' : '(not received yet)') + '<br>';
+      html += '<b>Speed Accuracy:</b> ' + ridLookup(RID_SPEED_ACC, dr.speedAcc) + '<br>';
+      html += '<b>Time Accuracy:</b> ' + (dr.timestampAcc > 0 ? ('&plusmn;' + (dr.timestampAcc / 10).toFixed(1) + ' s') : '(not received yet)') + '<br>';
+      html += '<br><u>Operator</u><br>';
+      html += '<b>Operator Location Type:</b> ' + ridLookup(RID_OP_LOC_TYPE, dr.opLocType) + '<br>';
+      html += '<b>Operator Location:</b> ' + (dr.opLocValid ? (dr.opLat.toFixed(7) + ', ' + dr.opLon.toFixed(7)) : '(not received yet)') + '<br>';
+      html += '</div>';
+    }
+    html += '</div>';
+  });
+  listDiv.innerHTML = html;
+}
+const pollRidScan = function(){
+  fetch('/ridscanstatus')
+    .then(r=>r.json())
+    .then(d=>{
+      ridLastData = d;
+      ridRenderDroneList(d);
+    })
+    .catch(() => {
+      document.getElementById('ridScanStatus').textContent = 'Lost contact with the device.';
+    });
 };
 
 document.querySelectorAll('.tab').forEach(t => {
@@ -2317,8 +2973,9 @@ void applyStaticIpIfEnabled() {
   }
 }
 
-String guessBleDeviceType(BLEAdvertisedDevice &dev) {
-  String name = dev.haveName() ? dev.getName() : "";
+String guessBleDeviceType(const String &name, int companyId, bool hasFastPair, bool hasHeartRate, bool hasHid, bool isDrone) {
+  if (isDrone) return "Drone (Remote ID / ASTM F3411 broadcast)";
+
   String nameUpper = name;
   nameUpper.toUpperCase();
 
@@ -2334,24 +2991,9 @@ String guessBleDeviceType(BLEAdvertisedDevice &dev) {
   if (nameUpper.indexOf("MI BAND") >= 0) return "Xiaomi Mi Band";
 
   // Service UUIDs: Fast Pair (0xFE2C) shows up on most Android phones and accessories.
-  if (dev.haveServiceUUID()) {
-    for (int i = 0; i < dev.getServiceUUIDCount(); i++) {
-      String uuid = dev.getServiceUUID(i).toString();
-      uuid.toLowerCase();
-      if (uuid.indexOf("fe2c") >= 0) return "Android (Fast Pair)";
-      if (uuid.indexOf("180d") >= 0) return "Heart rate monitor";
-      if (uuid.indexOf("1812") >= 0) return "HID device (keyboard/mouse/remote)";
-    }
-  }
-
-  // Manufacturer data: company ID is the first two bytes, little-endian.
-  int companyId = -1;
-  if (dev.haveManufacturerData()) {
-    String mfg = dev.getManufacturerData();
-    if (mfg.length() >= 2) {
-      companyId = (uint8_t)mfg[0] | ((uint8_t)mfg[1] << 8);
-    }
-  }
+  if (hasFastPair) return "Android (Fast Pair)";
+  if (hasHeartRate) return "Heart rate monitor";
+  if (hasHid) return "HID device (keyboard/mouse/remote)";
 
   if (companyId == 0x004C) {  // Apple
     if (name.length() > 0) return "Apple device (" + name + ")";
@@ -2368,25 +3010,91 @@ String guessBleDeviceType(BLEAdvertisedDevice &dev) {
   return "Unknown BLE device";
 }
 
+static int bleGenericGapHandler(struct ble_gap_event *event, void *arg) {
+  if (event->type != BLE_GAP_EVENT_EXT_DISC) {
+    return 0;
+  }
+  const struct ble_gap_ext_disc_desc &d = event->ext_disc;
+
+  char macBuf[18];
+  snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           d.addr.val[5], d.addr.val[4], d.addr.val[3],
+           d.addr.val[2], d.addr.val[1], d.addr.val[0]);
+  String mac = String(macBuf);
+
+  int idx = bleGenericFindOrAddDevice(mac);
+  if (idx < 0) return 0;
+  bleGenericDevices[idx].rssi = (int)d.rssi;
+  bleGenericDevices[idx].lastSeenMs = millis();
+
+  int i = 0;
+  while (i < d.length_data) {
+    uint8_t adLen = d.data[i];
+    if (adLen == 0) break;
+    if (i + 1 + adLen > d.length_data) break;
+    uint8_t adType = d.data[i + 1];
+
+    if ((adType == 0x08 || adType == 0x09) && adLen >= 2) {
+      String nm = "";
+      for (int k = 0; k < adLen - 1; k++) nm += (char)d.data[i + 2 + k];
+      if (adType == 0x09 || bleGenericDevices[idx].name.length() == 0) {
+        bleGenericDevices[idx].name = nm;
+      }
+    } else if ((adType == 0x02 || adType == 0x03) && adLen >= 3) {
+      int numUuidBytes = adLen - 1;
+      for (int k = 0; k + 2 <= numUuidBytes; k += 2) {
+        uint16_t uuid = d.data[i + 2 + k] | (d.data[i + 3 + k] << 8);
+        if (uuid == 0xFE2C) bleGenericDevices[idx].hasFastPair = true;
+        if (uuid == 0x180D) bleGenericDevices[idx].hasHeartRate = true;
+        if (uuid == 0x1812) bleGenericDevices[idx].hasHid = true;
+      }
+    } else if (adType == 0xFF && adLen >= 3) {
+      bleGenericDevices[idx].companyId = d.data[i + 2] | (d.data[i + 3] << 8);
+    } else if (adType == 0x16 && adLen >= 3) {
+      uint16_t svcUuid = d.data[i + 2] | (d.data[i + 3] << 8);
+      if (svcUuid == 0xFFFA) {
+        bleGenericDevices[idx].isDrone = true;
+      }
+    }
+
+    i += 1 + adLen;
+  }
+  return 0;
+}
+
 void bleScanTask(void *param) {
-  BLEScan *pBLEScan = BLEDevice::getScan();
-  pBLEScan->setActiveScan(true);
-  pBLEScan->setInterval(100);
-  pBLEScan->setWindow(99);
+  bleGenericDeviceCount = 0;
+
+  struct ble_gap_ext_disc_params bleGenParams = {};
+  bleGenParams.itvl = 64;
+  bleGenParams.window = 64;
+  bleGenParams.passive = 0;
+  bleGenParams.disable_observer_mode = 0;
+  struct ble_gap_ext_disc_params bleGenCodedParams = bleGenParams;
 
   Serial.println("Starting BLE scan...");
-  BLEScanResults *foundDevices = pBLEScan->start(8, false);
+  int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                             BLE_HCI_SCAN_FILT_NO_WL, 0,
+                             &bleGenParams, &bleGenCodedParams,
+                             bleGenericGapHandler, NULL);
+  if (rc != 0) {
+    Serial.println("[BLE scan debug] ble_gap_ext_disc() failed, rc=" + String(rc));
+  }
 
-  int count = foundDevices->getCount();
+  delay(8000);
+  ble_gap_disc_cancel();
+
+  int count = bleGenericDeviceCount;
   String result = "Found " + String(count) + " BLE device" + (count == 1 ? "" : "s") + ":\n\n";
   String devicesJson = "[";
 
   for (int i = 0; i < count; i++) {
-    BLEAdvertisedDevice dev = foundDevices->getDevice(i);
-    String name = dev.haveName() ? dev.getName() : "(no name)";
-    String mac = dev.getAddress().toString();
-    int rssi = dev.haveRSSI() ? dev.getRSSI() : 0;
-    String guess = guessBleDeviceType(dev);
+    String name = bleGenericDevices[i].name.length() > 0 ? bleGenericDevices[i].name : "(no name)";
+    String mac = bleGenericDevices[i].mac;
+    int rssi = bleGenericDevices[i].rssi;
+    String guess = guessBleDeviceType(bleGenericDevices[i].name, bleGenericDevices[i].companyId,
+                                       bleGenericDevices[i].hasFastPair, bleGenericDevices[i].hasHeartRate,
+                                       bleGenericDevices[i].hasHid, bleGenericDevices[i].isDrone);
 
     result += name + "\n";
     result += "  MAC: " + mac + "\n";
@@ -2400,7 +3108,7 @@ void bleScanTask(void *param) {
   }
   devicesJson += "]";
 
-  pBLEScan->clearResults();
+  bleGenericDeviceCount = 0;
 
   bleScanDevicesJson = devicesJson;
   bleScanTaskResult = result;
@@ -2409,25 +3117,43 @@ void bleScanTask(void *param) {
   vTaskDelete(NULL);
 }
 
+static int radarGapHandler(struct ble_gap_event *event, void *arg) {
+  if (event->type != BLE_GAP_EVENT_EXT_DISC) {
+    return 0;
+  }
+  const struct ble_gap_ext_disc_desc &d = event->ext_disc;
+  char macBuf[18];
+  snprintf(macBuf, sizeof(macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           d.addr.val[5], d.addr.val[4], d.addr.val[3],
+           d.addr.val[2], d.addr.val[1], d.addr.val[0]);
+  String mac = String(macBuf);
+  if (mac.equalsIgnoreCase(radarTargetMac)) {
+    radarLastRssi = (int)d.rssi;
+    radarLastSeenMs = millis();
+  }
+  return 0;
+}
+
 void radarTask(void *param) {
-  BLEScan *pBLEScan = BLEDevice::getScan();
-  pBLEScan->setActiveScan(true);
-  pBLEScan->setInterval(80);
-  pBLEScan->setWindow(60);
+  struct ble_gap_ext_disc_params radarParams = {};
+  radarParams.itvl = 64;
+  radarParams.window = 64;
+  radarParams.passive = 0;
+  radarParams.disable_observer_mode = 0;
+  struct ble_gap_ext_disc_params radarCodedParams = radarParams;
+
+  int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                             BLE_HCI_SCAN_FILT_NO_WL, 0,
+                             &radarParams, &radarCodedParams,
+                             radarGapHandler, NULL);
+  if (rc != 0) {
+    Serial.println("[Radar debug] ble_gap_ext_disc() failed, rc=" + String(rc));
+  }
 
   while (radarActive) {
-    BLEScanResults *found = pBLEScan->start(1, false);
-    for (int i = 0; i < found->getCount(); i++) {
-      BLEAdvertisedDevice dev = found->getDevice(i);
-      String mac = dev.getAddress().toString();
-      if (mac.equalsIgnoreCase(radarTargetMac)) {
-        if (dev.haveRSSI()) radarLastRssi = dev.getRSSI();
-        radarLastSeenMs = millis();
-        break;
-      }
-    }
-    pBLEScan->clearResults();
+    delay(200);
   }
+  ble_gap_disc_cancel();
   vTaskDelete(NULL);
 }
 
@@ -3142,6 +3868,31 @@ void setup() {
     json += ",\"gateway\":\"" + staticGateway + "\"";
     json += ",\"dns1\":\"" + staticDns1 + "\"";
     json += ",\"dns2\":\"" + staticDns2 + "\"}";
+    req->send(200, "application/json", json);
+  });
+
+  server.on("/ridscanstart", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!ridScanActive) {
+      ridScanActive = true;
+      ridDroneCount = 0;
+      if (req->hasParam("mode") && req->getParam("mode")->value() == "wifi") {
+        ridScanMode = 1;
+        xTaskCreate(wifiRidScanTask, "wifiRidScanTask", 4096, NULL, 1, &ridScanTaskHandle);
+      } else {
+        ridScanMode = 0;
+        xTaskCreate(ridScanTask, "ridScanTask", 4096, NULL, 1, &ridScanTaskHandle);
+      }
+    }
+    req->send(200, "application/json", "{\"running\":true}");
+  });
+
+  server.on("/ridscanstop", HTTP_GET, [](AsyncWebServerRequest* req) {
+    ridScanActive = false;
+    req->send(200, "application/json", "{\"running\":false}");
+  });
+
+  server.on("/ridscanstatus", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String json = "{\"running\":" + String(ridScanActive ? "true" : "false") + ",\"drones\":" + ridBuildJson() + "}";
     req->send(200, "application/json", json);
   });
 
