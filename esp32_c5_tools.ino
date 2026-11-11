@@ -9,6 +9,8 @@
 #include <esp_wifi.h>
 #include "esp_wifi_ap_get_sta_list.h"
 #include <Preferences.h>
+#define MQTT_MAX_PACKET_SIZE 2048
+#include <PubSubClient.h>
 #include <Adafruit_NeoPixel.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -25,6 +27,8 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
+#define FIRMWARE_VERSION "v2.12.1"
+
 // ---- RGB LED (WS2812 on GPIO27 - confirmed via color-cycle test) ----
 #define RGB_LED_PIN 27
 Adafruit_NeoPixel rgbLed(1, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -39,6 +43,21 @@ unsigned long lastConnectedMs = 0;
 const unsigned long BAND_FALLBACK_TIMEOUT_MS = 20000;  // how long disconnected before giving up on 5GHz
 bool useStaticIp = false;
 String staticIp = "";
+bool meshModeEnabled = false;
+bool bleScheduleActive = false;
+unsigned long bleScheduleIntervalMs = 0;
+unsigned long bleScheduleNextRunMs = 0;
+bool ridScheduleActive = false;
+unsigned long ridScheduleIntervalMs = 0;
+unsigned long ridScheduleNextRunMs = 0;
+String meshNodeId = "";
+String meshName = "";
+String meshPassword = "";
+String meshServerAddr = "";
+bool meshServerConnected = false;
+WiFiClient meshWifiClient;
+PubSubClient meshMqttClient(meshWifiClient);
+unsigned long meshLastReconnectAttemptMs = 0;
 String staticSubnet = "";
 String staticGateway = "";
 String staticDns1 = "";
@@ -53,6 +72,9 @@ struct BleGenericDevice {
   String name;
   int rssi;
   int companyId;
+  int appleAdvType;  // byte after Apple's company ID in 0xFF manufacturer data; -1 = not Apple / not captured
+  String mfgDataHex;  // raw 0xFF manufacturer-specific data (company ID + payload) as hex, for diagnostics
+  int appearance;  // GAP Appearance AD field (0x19), standards-based device-category hint; -1 = not present
   bool hasFastPair;
   bool hasHeartRate;
   bool hasHid;
@@ -71,6 +93,9 @@ int bleGenericFindOrAddDevice(const String &mac) {
     bleGenericDevices[bleGenericDeviceCount].name = "";
     bleGenericDevices[bleGenericDeviceCount].rssi = 0;
     bleGenericDevices[bleGenericDeviceCount].companyId = -1;
+    bleGenericDevices[bleGenericDeviceCount].appleAdvType = -1;
+    bleGenericDevices[bleGenericDeviceCount].mfgDataHex = "";
+    bleGenericDevices[bleGenericDeviceCount].appearance = -1;
     bleGenericDevices[bleGenericDeviceCount].hasFastPair = false;
     bleGenericDevices[bleGenericDeviceCount].hasHeartRate = false;
     bleGenericDevices[bleGenericDeviceCount].hasHid = false;
@@ -537,6 +562,18 @@ void updateStatusLed() {
     return;
   }
 
+  extern bool pcapCaptureActive;
+  if (pcapCaptureActive) {
+    unsigned long now = millis();
+    if (now - lastLedBlinkMs > 100) {
+      lastLedBlinkMs = now;
+      ledBlinkState = !ledBlinkState;
+    }
+    rgbLed.setPixelColor(0, ledBlinkState ? rgbLed.Color(0, 0, 60) : rgbLed.Color(60, 0, 0));  // fast cycle blue/red: packet capture active
+    rgbLed.show();
+    return;
+  }
+
   extern bool ridScanActive;
   if (ridScanActive) {
     unsigned long now = millis();
@@ -597,14 +634,31 @@ void updateStatusLed() {
 
     if (bandBlinkStep == 0) {
       rgbLed.setPixelColor(0, rgbLed.Color(0, 60, 0));  // solid green: connected to home network
-    } else {
+    } else if (bandBlinkStep <= 4) {
       if (now - bandBlinkStepStart >= 100) {
         bandBlinkStepStart = now;
         bandBlinkStep++;
-        if (bandBlinkStep > 4) bandBlinkStep = 0;
+        if (bandBlinkStep > 4) bandBlinkStep = meshModeEnabled ? 5 : 0;
       }
       bool blinkOn = (bandBlinkStep == 1 || bandBlinkStep == 3);
       rgbLed.setPixelColor(0, blinkOn ? bandColor : 0);  // every 15s: fast double-blink green=2.4GHz, blue=5GHz
+    } else if (bandBlinkStep <= 8) {
+      if (now - bandBlinkStepStart >= 300) {
+        bandBlinkStepStart = now;
+        bandBlinkStep++;
+        if (bandBlinkStep > 8) bandBlinkStep = 9;
+      }
+      bool blinkOn = (bandBlinkStep == 5 || bandBlinkStep == 7);
+      rgbLed.setPixelColor(0, blinkOn ? rgbLed.Color(60, 0, 0) : 0);  // mesh mode: 2 slow red heartbeat pulses, attempting to reach server
+    } else {
+      if (now - bandBlinkStepStart >= 300) {
+        bandBlinkStepStart = now;
+        bandBlinkStep++;
+        if (bandBlinkStep > 10) bandBlinkStep = 0;
+      }
+      bool blinkOn = (bandBlinkStep == 9);
+      uint32_t meshColor = meshServerConnected ? rgbLed.Color(40, 0, 60) : rgbLed.Color(60, 0, 0);
+      rgbLed.setPixelColor(0, blinkOn ? meshColor : 0);  // mesh mode: 3rd pulse, purple if connected to server else slow red
     }
   }
   rgbLed.show();
@@ -649,8 +703,9 @@ String doNetStatus() {
     json += "]}";
   } else {
     String bandStr = (WiFi.getBand() == WIFI_BAND_5G) ? "5GHz" : "2.4GHz";
+    String hostname = (meshModeEnabled && meshNodeId.length() > 0) ? ("esp32-c5-" + meshNodeId) : "esp32-c5";
     json += "\"mode\":\"sta\",\"ssid\":\"" + savedSsid + "\",\"band\":\"" + bandStr + "\",\"rssi\":" + String(WiFi.RSSI()) +
-            ",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+            ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"hostname\":\"" + hostname + "\"}";
   }
   return json;
 }
@@ -658,6 +713,7 @@ String doNetStatus() {
 // ===== PORT SCAN + OS GUESS TOOL =====
 #include <lwip/sockets.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
 struct PortInfo { uint16_t port; const char* name; };
 static const PortInfo TCP_COMMON_PORTS[] = {
@@ -1748,6 +1804,147 @@ void wifiRidScanTask(void *param) {
   vTaskDelete(NULL);
 }
 
+// ===== BEGIN 802.11 PACKET CAPTURE (PCAP) TOOL =====
+bool pcapCaptureActive = false;
+bool pcapMgmtOnly = false;
+File pcapFile;
+unsigned long pcapPacketCount = 0;
+unsigned long pcapBytesWritten = 0;
+TaskHandle_t pcapCaptureTaskHandle = NULL;
+const char *PCAP_FILE_PATH = "/capture.pcap";
+const int PCAP_SNAPLEN = 2048;
+
+void pcapWriteGlobalHeader(File &f) {
+  uint32_t magic = 0xa1b2c3d4;
+  uint16_t vmaj = 2, vmin = 4;
+  int32_t zone = 0;
+  uint32_t sigfigs = 0;
+  uint32_t snaplen = (uint32_t)PCAP_SNAPLEN;
+  uint32_t network = 105;  // DLT_IEEE802_11 -- raw 802.11 frames, no radiotap header
+  uint8_t hdr[24];
+  memcpy(hdr + 0, &magic, 4);
+  memcpy(hdr + 4, &vmaj, 2);
+  memcpy(hdr + 6, &vmin, 2);
+  memcpy(hdr + 8, &zone, 4);
+  memcpy(hdr + 12, &sigfigs, 4);
+  memcpy(hdr + 16, &snaplen, 4);
+  memcpy(hdr + 20, &network, 4);
+  f.write(hdr, 24);
+}
+
+void pcapPromiscCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
+  if (!pcapCaptureActive) return;
+  if (pcapMgmtOnly && type != WIFI_PKT_MGMT) return;
+
+  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+  int len = pkt->rx_ctrl.sig_len;
+  if (len <= 0) return;
+  int capLen = (len > PCAP_SNAPLEN) ? PCAP_SNAPLEN : len;
+
+  // Guard against filling the SPIFFS partition -- same free-space check
+  // pattern already used by the TFTP file-upload feature.
+  size_t freeNow = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+  if (freeNow < (size_t)(capLen + 64)) {
+    pcapCaptureActive = false;
+    return;
+  }
+
+  uint32_t nowMs = millis();
+  uint32_t ts_sec = nowMs / 1000;
+  uint32_t ts_usec = (nowMs % 1000) * 1000;
+  uint32_t incl = (uint32_t)capLen;
+  uint32_t orig = (uint32_t)len;
+  uint8_t rec[16];
+  memcpy(rec + 0, &ts_sec, 4);
+  memcpy(rec + 4, &ts_usec, 4);
+  memcpy(rec + 8, &incl, 4);
+  memcpy(rec + 12, &orig, 4);
+
+  pcapFile.write(rec, 16);
+  pcapFile.write(pkt->payload, capLen);
+  pcapPacketCount++;
+  pcapBytesWritten += 16 + capLen;
+}
+
+void pcapCaptureTask(void *param) {
+  esp_wifi_set_promiscuous_rx_cb(&pcapPromiscCallback);
+  esp_wifi_set_promiscuous(true);
+  const uint8_t pcapChannels[] = {1, 6, 11};
+  int pcapChIdx = 0;
+  while (pcapCaptureActive) {
+    esp_wifi_set_channel(pcapChannels[pcapChIdx], WIFI_SECOND_CHAN_NONE);
+    pcapChIdx = (pcapChIdx + 1) % 3;
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+  esp_wifi_set_promiscuous(false);
+  pcapFile.close();
+  Serial.println("Packet capture stopped. " + String(pcapPacketCount) + " packets, " +
+                  String(pcapBytesWritten) + " bytes written to " + String(PCAP_FILE_PATH));
+  pcapCaptureTaskHandle = NULL;
+  vTaskDelete(NULL);
+}
+const int PCAP_UPLOAD_PORT = 8080;  // matches the portal's plain-HTTP device-upload listener (see run.sh)
+
+void pcapUploadTask(void *param) {
+  if (!meshModeEnabled || !meshServerConnected) {
+    Serial.println("Mesh: pcap upload requested but mesh is not connected");
+    vTaskDelete(NULL);
+    return;
+  }
+  if (!SPIFFS.exists(PCAP_FILE_PATH)) {
+    Serial.println("Mesh: pcap upload requested but no capture file exists");
+    vTaskDelete(NULL);
+    return;
+  }
+  File f = SPIFFS.open(PCAP_FILE_PATH, "r");
+  if (!f) {
+    Serial.println("Mesh: failed to open capture file for upload");
+    vTaskDelete(NULL);
+    return;
+  }
+  size_t fileSize = f.size();
+
+  WiFiClient client;  // plain HTTP -- see PCAP_UPLOAD_PORT comment above for why
+  HTTPClient http;
+  String url = "http://" + meshServerAddr + ":" + String(PCAP_UPLOAD_PORT) +
+               "/nodes/" + meshNodeId + "/pcap_upload";
+  Serial.println("Mesh: uploading pcap (" + String(fileSize) + " bytes) to " + url);
+  if (!http.begin(client, url)) {
+    Serial.println("Mesh: pcap upload http.begin() failed");
+    f.close();
+    vTaskDelete(NULL);
+    return;
+  }
+  http.addHeader("Content-Type", "application/vnd.tcpdump.pcap");
+  int code = http.sendRequest("POST", &f, fileSize);
+  Serial.println("Mesh: pcap upload result code=" + String(code));
+  http.end();
+  f.close();
+  vTaskDelete(NULL);
+}
+
+bool startPcapCaptureIfIdle(bool mgmtOnly) {
+  if (pcapCaptureActive) return false;
+  if (ridScanActive) return false;
+  pcapMgmtOnly = mgmtOnly;
+  if (SPIFFS.exists(PCAP_FILE_PATH)) SPIFFS.remove(PCAP_FILE_PATH);
+  pcapFile = SPIFFS.open(PCAP_FILE_PATH, "w");
+  if (!pcapFile) return false;
+  pcapWriteGlobalHeader(pcapFile);
+  pcapPacketCount = 0;
+  pcapBytesWritten = 24;
+  pcapCaptureActive = true;
+  xTaskCreate(pcapCaptureTask, "pcapCaptureTask", 4096, NULL, 1, &pcapCaptureTaskHandle);
+  Serial.println(String("Packet capture started (") + (pcapMgmtOnly ? "management frames only" : "all 802.11 traffic") + ")");
+  return true;
+}
+
+void stopPcapCapture() {
+  pcapCaptureActive = false;
+}
+
+// ===== END 802.11 PACKET CAPTURE (PCAP) TOOL =====
+
 void ridScanTask(void *param) {
   BLEScan *pBLEScan = BLEDevice::getScan();
   pBLEScan->setActiveScan(true);
@@ -1817,7 +2014,7 @@ table{color:var(--neon-dim);font-size:0.85rem;}
 th{color:var(--accent2);}
 </style></head><body>
 <h1>FortiGill ESP32-C5 Net Tools</h1>
-<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v1.19.0</div>
+<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v2.12.1</div>
 <div id="netStatusBanner" style="margin-bottom:1rem;padding:0.6rem;border:1px solid var(--border);border-radius:6px;background:var(--bg2);font-size:0.9rem;">Loading network status...</div>
 <div class="tabs">
   <div class="tab active" data-panel="sysstatus">System Status</div>
@@ -2010,6 +2207,23 @@ th{color:var(--accent2);}
   </label>
   <button onclick="saveWifi()">Save & Reboot</button>
   <pre id="wifiResult" style="margin-top:1rem;">Settings will save to flash and reboot the device.</pre>
+
+  <hr style="margin:1rem 0;border-color:var(--neon-dim);opacity:0.3;">
+  <label style="display:flex;align-items:center;gap:0.4rem;">
+    <input type="checkbox" id="meshToggle" style="width:auto;margin:0;" onchange="toggleMeshFields()"> Join a mesh network
+  </label>
+  <div id="meshFields" style="display:none;margin-top:0.6rem;">
+    <label>Node ID <span style="color:var(--neon-dim);font-size:0.8rem;">(used for esp32-c5-&lt;id&gt;.local)</span></label>
+    <input id="meshNodeId" placeholder="e.g. backyard1">
+    <label>Mesh Name</label>
+    <input id="meshNameField" placeholder="e.g. homemesh">
+    <label>Mesh Password</label>
+    <input id="meshPassField" type="password" placeholder="Shared mesh password">
+    <label>Server IP or FQDN</label>
+    <input id="meshServerField" placeholder="e.g. 10.13.37.27 or portal.local">
+    <button onclick="saveMeshSettings()" style="margin-top:0.6rem;">Save Mesh Settings & Reboot</button>
+    <pre id="meshResult" style="margin-top:1rem;">Loading current mesh settings...</pre>
+  </div>
 </div>
 
 <div class="panel" id="netsettings">
@@ -2918,7 +3132,7 @@ const loadNetStatus = function(){
   fetch('/netstatus').then(r=>r.json()).then(d=>{
     const el = document.getElementById('netStatusBanner');
     if (d.mode === 'sta') {
-      el.innerHTML = 'Connected to <b>' + d.ssid + '</b> (' + d.band + ') &nbsp; RSSI: ' + d.rssi + ' dBm &nbsp; IP: ' + d.ip + ' &nbsp; (also at <b>esp32-c5.local</b>)';
+      el.innerHTML = 'Connected to <b>' + d.ssid + '</b> (' + d.band + ') &nbsp; RSSI: ' + d.rssi + ' dBm &nbsp; IP: ' + d.ip + ' &nbsp; (also at <b>' + d.hostname + '.local</b>)';
       const scan24Btn = document.getElementById('scan24Btn');
       const scan5Btn = document.getElementById('scan5Btn');
       if (d.band === '5GHz') {
@@ -2955,6 +3169,40 @@ const loadNetStatus = function(){
 };
 setInterval(loadNetStatus, 3000);
 loadNetStatus();
+
+const toggleMeshFields = function(){
+  const show = document.getElementById('meshToggle').checked;
+  document.getElementById('meshFields').style.display = show ? 'block' : 'none';
+};
+
+const saveMeshSettings = function(){
+  const enabled = document.getElementById('meshToggle').checked;
+  const params = new URLSearchParams();
+  params.set('enabled', enabled ? '1' : '0');
+  params.set('nodeid', document.getElementById('meshNodeId').value.trim());
+  params.set('meshname', document.getElementById('meshNameField').value.trim());
+  params.set('meshpass', document.getElementById('meshPassField').value.trim());
+  params.set('server', document.getElementById('meshServerField').value.trim());
+  document.getElementById('meshResult').textContent = 'Saving mesh settings and rebooting...';
+  fetch('/savemesh?' + params.toString())
+    .then(r=>r.text())
+    .then(t=>{
+      document.getElementById('meshResult').textContent = t;
+    });
+};
+
+const loadMeshStatus = function(){
+  fetch('/meshconfig').then(r=>r.json()).then(d=>{
+    document.getElementById('meshToggle').checked = d.enabled;
+    document.getElementById('meshFields').style.display = d.enabled ? 'block' : 'none';
+    document.getElementById('meshNodeId').value = d.nodeid;
+    document.getElementById('meshNameField').value = d.meshname;
+    document.getElementById('meshServerField').value = d.server;
+    document.getElementById('meshResult').textContent = 'Settings save to flash and reboot the device.';
+    // Mesh password intentionally not sent back by the server, so it's left blank here.
+  });
+};
+loadMeshStatus();
 </script>
 </body></html>
 )HTML";
@@ -2973,7 +3221,7 @@ void applyStaticIpIfEnabled() {
   }
 }
 
-String guessBleDeviceType(const String &name, int companyId, bool hasFastPair, bool hasHeartRate, bool hasHid, bool isDrone) {
+String guessBleDeviceType(const String &name, int companyId, int appleAdvType, bool hasFastPair, bool hasHeartRate, bool hasHid, bool isDrone) {
   if (isDrone) return "Drone (Remote ID / ASTM F3411 broadcast)";
 
   String nameUpper = name;
@@ -2996,6 +3244,28 @@ String guessBleDeviceType(const String &name, int companyId, bool hasFastPair, b
   if (hasHid) return "HID device (keyboard/mouse/remote)";
 
   if (companyId == 0x004C) {  // Apple
+    if (appleAdvType == 0x12) {
+      // Apple "Find My" network accessory broadcast -- re-validated
+      // against real capture data: a confirmed iPhone showed type 0x10
+      // (ordinary "Nearby" continuity) instead, and only 1 of 6 nearby
+      // Apple devices in a real test scan showed 0x12. Shared by
+      // AirTags, AirPods, and other Find My-compatible trackers, so it
+      // can't be narrowed to "AirTag" specifically from this byte alone.
+      return "Apple Find My accessory (AirTag, AirPods, or similar tracker)";
+    }
+    if (appleAdvType == 0x07) {
+      // Apple "Proximity Pairing" message -- documented specifically as
+      // the AirPods/audio-accessory pairing broadcast (furiousMAC
+      // continuity project), distinct from ordinary Nearby (0x10).
+      // Only sent around pairing events (e.g. case lid opened), not
+      // continuously.
+      return "Apple AirPods (or similar audio accessory)";
+    }
+    // NOTE: no verified, documented way found to identify "iPhone"
+    // specifically (vs iPad/Mac/Watch) from the ordinary Nearby (0x10)
+    // broadcast -- checked furiousMAC's continuity docs and a real
+    // open-source parser, neither defines a device-type field for it.
+    // Staying generic here rather than guessing.
     if (name.length() > 0) return "Apple device (" + name + ")";
     return "Apple device (iPhone/iPad/Mac/Watch)";
   }
@@ -3050,11 +3320,28 @@ static int bleGenericGapHandler(struct ble_gap_event *event, void *arg) {
       }
     } else if (adType == 0xFF && adLen >= 3) {
       bleGenericDevices[idx].companyId = d.data[i + 2] | (d.data[i + 3] << 8);
+      if (bleGenericDevices[idx].companyId == 0x004C && adLen >= 4) {
+        bleGenericDevices[idx].appleAdvType = d.data[i + 4];
+      }
+      // Dump the full manufacturer-specific payload as hex for diagnostics --
+      // this is what lets us fingerprint Apple message types, Tile, and
+      // Samsung SmartTag correctly later instead of guessing from memory.
+      String hex = "";
+      for (int k = 0; k < adLen - 1; k++) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", d.data[i + 2 + k]);
+        hex += buf;
+      }
+      bleGenericDevices[idx].mfgDataHex = hex;
     } else if (adType == 0x16 && adLen >= 3) {
       uint16_t svcUuid = d.data[i + 2] | (d.data[i + 3] << 8);
       if (svcUuid == 0xFFFA) {
         bleGenericDevices[idx].isDrone = true;
       }
+    } else if (adType == 0x19 && adLen >= 3) {
+      // GAP Appearance -- diagnostics only for now, see note at top of
+      // this patch script before attaching any classification to it.
+      bleGenericDevices[idx].appearance = d.data[i + 2] | (d.data[i + 3] << 8);
     }
 
     i += 1 + adLen;
@@ -3093,8 +3380,9 @@ void bleScanTask(void *param) {
     String mac = bleGenericDevices[i].mac;
     int rssi = bleGenericDevices[i].rssi;
     String guess = guessBleDeviceType(bleGenericDevices[i].name, bleGenericDevices[i].companyId,
-                                       bleGenericDevices[i].hasFastPair, bleGenericDevices[i].hasHeartRate,
-                                       bleGenericDevices[i].hasHid, bleGenericDevices[i].isDrone);
+                                       bleGenericDevices[i].appleAdvType, bleGenericDevices[i].hasFastPair,
+                                       bleGenericDevices[i].hasHeartRate, bleGenericDevices[i].hasHid,
+                                       bleGenericDevices[i].isDrone);
 
     result += name + "\n";
     result += "  MAC: " + mac + "\n";
@@ -3102,6 +3390,16 @@ void bleScanTask(void *param) {
     result += "  Guess: " + guess + "\n\n";
 
     Serial.println("Found: " + name + " (" + mac + ") RSSI " + String(rssi) + " - " + guess);
+    if (bleGenericDevices[i].mfgDataHex.length() > 0) {
+      Serial.println("  MfgData: " + bleGenericDevices[i].mfgDataHex +
+                      " (companyId=0x" + String(bleGenericDevices[i].companyId, HEX) + ")");
+    }
+    if (bleGenericDevices[i].appearance >= 0) {
+      int category = bleGenericDevices[i].appearance >> 6;
+      int sub = bleGenericDevices[i].appearance & 0x3F;
+      Serial.println("  Appearance: 0x" + String(bleGenericDevices[i].appearance, HEX) +
+                      " (category=0x" + String(category, HEX) + ", sub=0x" + String(sub, HEX) + ")");
+    }
 
     if (i > 0) devicesJson += ",";
     devicesJson += "{\"name\":\"" + jsonEscapeForWifiScan(name) + "\",\"mac\":\"" + mac + "\",\"rssi\":" + String(rssi) + ",\"guess\":\"" + jsonEscapeForWifiScan(guess) + "\"}";
@@ -3653,6 +3951,11 @@ void setup() {
   staticGateway = preferences.getString("staticGw", "");
   staticDns1 = preferences.getString("staticDns1", "");
   staticDns2 = preferences.getString("staticDns2", "");
+  meshModeEnabled = preferences.getBool("meshOn", false);
+  meshNodeId = preferences.getString("meshNodeId", "");
+  meshName = preferences.getString("meshName", "");
+  meshPassword = preferences.getString("meshPass", "");
+  meshServerAddr = preferences.getString("meshServer", "");
 
   rgbLed.begin();
   rgbLed.setBrightness(80);
@@ -3788,9 +4091,10 @@ void setup() {
       rgbLedOn = !savedLedOff;
     }
 
-    if (MDNS.begin("esp32-c5")) {
+    String mdnsHostname = (meshModeEnabled && meshNodeId.length() > 0) ? ("esp32-c5-" + meshNodeId) : "esp32-c5";
+    if (MDNS.begin(mdnsHostname.c_str())) {
       MDNS.addService("http", "tcp", 80);
-      Serial.println("mDNS responder started: http://esp32-c5.local");
+      Serial.println("mDNS responder started: http://" + mdnsHostname + ".local");
     } else {
       Serial.println("Error starting mDNS responder");
     }
@@ -3860,6 +4164,30 @@ void setup() {
     ESP.restart();
   });
 
+  server.on("/savemesh", HTTP_GET, [](AsyncWebServerRequest* req) {
+    bool enableMesh = req->hasParam("enabled") && req->getParam("enabled")->value() == "1";
+    preferences.putBool("meshOn", enableMesh);
+    if (enableMesh) {
+      preferences.putString("meshNodeId", req->hasParam("nodeid") ? req->getParam("nodeid")->value() : "");
+      preferences.putString("meshName", req->hasParam("meshname") ? req->getParam("meshname")->value() : "");
+      preferences.putString("meshPass", req->hasParam("meshpass") ? req->getParam("meshpass")->value() : "");
+      preferences.putString("meshServer", req->hasParam("server") ? req->getParam("server")->value() : "");
+    }
+    req->send(200, "text/plain", "Mesh settings saved! Rebooting device now...");
+    delay(1000);
+    ESP.restart();
+  });
+
+  server.on("/meshconfig", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String json = "{\"enabled\":";
+    json += meshModeEnabled ? "true" : "false";
+    json += ",\"nodeid\":\"" + meshNodeId + "\"";
+    json += ",\"meshname\":\"" + meshName + "\"";
+    json += ",\"server\":\"" + meshServerAddr + "\"}";
+    // Mesh password is deliberately left out of this readback.
+    req->send(200, "application/json", json);
+  });
+
   server.on("/networkconfig", HTTP_GET, [](AsyncWebServerRequest* req) {
     String json = "{\"enabled\":";
     json += useStaticIp ? "true" : "false";
@@ -3876,6 +4204,11 @@ void setup() {
       ridScanActive = true;
       ridDroneCount = 0;
       if (req->hasParam("mode") && req->getParam("mode")->value() == "wifi") {
+        if (pcapCaptureActive) {
+          ridScanActive = false;  // roll back -- refusing to start
+          req->send(409, "text/plain", "Can't start WiFi-mode RID scan while a packet capture is running.");
+          return;
+        }
         ridScanMode = 1;
         xTaskCreate(wifiRidScanTask, "wifiRidScanTask", 4096, NULL, 1, &ridScanTaskHandle);
       } else {
@@ -3894,6 +4227,48 @@ void setup() {
   server.on("/ridscanstatus", HTTP_GET, [](AsyncWebServerRequest* req) {
     String json = "{\"running\":" + String(ridScanActive ? "true" : "false") + ",\"drones\":" + ridBuildJson() + "}";
     req->send(200, "application/json", json);
+  });
+
+  server.on("/pcapstart", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (pcapCaptureActive) {
+      req->send(409, "text/plain", "A packet capture is already running.");
+      return;
+    }
+    if (ridScanActive) {
+      req->send(409, "text/plain", "Can't start packet capture while a WiFi-mode RID scan is running.");
+      return;
+    }
+    bool mgmtOnly = req->hasParam("mgmtonly") && req->getParam("mgmtonly")->value() == "1";
+    if (!startPcapCaptureIfIdle(mgmtOnly)) {
+      req->send(500, "text/plain", "Failed to open capture file on SPIFFS.");
+      return;
+    }
+    req->send(200, "text/plain", String("Packet capture started (") + (pcapMgmtOnly ? "management frames only" : "all 802.11 traffic") + ").");
+  });
+
+  server.on("/pcapstop", HTTP_GET, [](AsyncWebServerRequest* req) {
+    stopPcapCapture();
+    req->send(200, "text/plain", "Packet capture stopping.");
+  });
+
+  server.on("/pcapstatus", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String json = "{\"active\":";
+    json += pcapCaptureActive ? "true" : "false";
+    json += ",\"mgmtOnly\":";
+    json += pcapMgmtOnly ? "true" : "false";
+    json += ",\"packetCount\":" + String(pcapPacketCount);
+    json += ",\"bytesWritten\":" + String(pcapBytesWritten);
+    json += ",\"spiffsFree\":" + String(SPIFFS.totalBytes() - SPIFFS.usedBytes());
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+
+  server.on("/pcapdownload", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (!SPIFFS.exists(PCAP_FILE_PATH)) {
+      req->send(404, "text/plain", "No capture file found. Run a capture first.");
+      return;
+    }
+    req->send(SPIFFS, PCAP_FILE_PATH, "application/vnd.tcpdump.pcap", true);
   });
 
   server.on("/blescan", HTTP_GET, [](AsyncWebServerRequest* req) {
@@ -4336,6 +4711,202 @@ void setup() {
   Serial.println("Web server started");
 }
 
+String meshStatusTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/status"; }
+String meshCmdTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/cmd"; }
+String meshTelemetryTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/telemetry"; }
+String meshVersionTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/version"; }
+
+// Minimal flat-JSON string-field extractor -- looks for "key":"value" and
+// returns value. Good enough for our simple {"action":"...","tool":"..."}
+// command payloads without pulling in a full JSON library.
+String meshJsonField(const String &json, const String &key) {
+  String keyPattern = "\"" + key + "\"";
+  int idx = json.indexOf(keyPattern);
+  if (idx < 0) return "";
+  int pos = idx + keyPattern.length();
+  // Tolerate whitespace around the colon (e.g. Python's json.dumps emits
+  // "key": "value" with a space, not "key":"value").
+  while (pos < (int)json.length() && (json[pos] == ' ' || json[pos] == ':')) pos++;
+  if (pos >= (int)json.length() || json[pos] != '"') return "";
+  pos++;  // skip the value's opening quote
+  int end = json.indexOf("\"", pos);
+  if (end < 0) return "";
+  return json.substring(pos, end);
+}
+
+long meshJsonFieldInt(const String &json, const String &key) {
+  String keyPattern = "\"" + key + "\"";
+  int idx = json.indexOf(keyPattern);
+  if (idx < 0) return -1;
+  int pos = idx + keyPattern.length();
+  while (pos < (int)json.length() && (json[pos] == ' ' || json[pos] == ':')) pos++;
+  int start = pos;
+  while (pos < (int)json.length() && isDigit(json[pos])) pos++;
+  if (pos == start) return -1;
+  return json.substring(start, pos).toInt();
+}
+
+void startBleScanIfIdle() {
+  if (!bleScanTaskRunning) {
+    bleScanTaskRunning = true;
+    bleScanTaskResult = "Scanning for BLE devices...";
+    bleScanDevicesJson = "[]";
+    xTaskCreate(bleScanTask, "bleScanTask", 8192, NULL, 1, NULL);
+  }
+}
+
+void startRidScanIfIdle() {
+  if (!ridScanActive) {
+    ridScanActive = true;
+    ridDroneCount = 0;
+    ridScanMode = 0;  // remote-triggered / scheduled starts default to BLE mode
+    xTaskCreate(ridScanTask, "ridScanTask", 4096, NULL, 1, &ridScanTaskHandle);
+  }
+}
+
+// Called every loop() tick. Re-triggers a scan the moment its schedule's
+// interval has elapsed, using the exact same start path as a manual
+// start, so scheduled runs behave identically and still publish over
+// mesh via the existing meshPublishTelemetryIfDue() change-detection.
+void meshRunScheduledScansIfDue() {
+  if (!meshModeEnabled || !meshServerConnected) return;
+  unsigned long now = millis();
+  if (bleScheduleActive && (long)(now - bleScheduleNextRunMs) >= 0) {
+    startBleScanIfIdle();
+    bleScheduleNextRunMs = now + bleScheduleIntervalMs;
+  }
+  if (ridScheduleActive && (long)(now - ridScheduleNextRunMs) >= 0) {
+    startRidScanIfIdle();
+    ridScheduleNextRunMs = now + ridScheduleIntervalMs;
+  }
+}
+
+void meshMqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  String action = meshJsonField(msg, "action");
+  String tool = meshJsonField(msg, "tool");
+  Serial.println("Mesh: received command: " + action + " " + tool);
+
+  if (action == "send_pcap") {
+    xTaskCreate(pcapUploadTask, "pcapUploadTask", 8192, NULL, 1, NULL);
+    return;
+  }
+
+  if (action == "pcap_start") {
+    long mgmtOnly = meshJsonFieldInt(msg, "mgmt_only");
+    bool started = startPcapCaptureIfIdle(mgmtOnly != 0);
+    Serial.println(started ? "Mesh: packet capture started"
+                            : "Mesh: packet capture start request ignored (already running or busy)");
+    return;
+  }
+
+  if (action == "pcap_stop") {
+    stopPcapCapture();
+    Serial.println("Mesh: packet capture stop requested");
+    return;
+  }
+
+  if (tool == "ble_scan") {
+    if (action == "start") {
+      startBleScanIfIdle();
+    } else if (action == "stop") {
+      bleScanTaskRunning = false;
+    } else if (action == "schedule") {
+      long minutes = meshJsonFieldInt(msg, "interval_minutes");
+      if (minutes > 0) {
+        bleScheduleActive = true;
+        bleScheduleIntervalMs = (unsigned long)minutes * 60000UL;
+        bleScheduleNextRunMs = millis();  // run immediately, then repeat
+        Serial.println("Mesh: BLE scan scheduled every " + String(minutes) + " min");
+      }
+    } else if (action == "unschedule") {
+      bleScheduleActive = false;
+      Serial.println("Mesh: BLE scan schedule cleared");
+    }
+  } else if (tool == "rid_scan") {
+    if (action == "start") {
+      startRidScanIfIdle();
+    } else if (action == "stop") {
+      ridScanActive = false;
+    } else if (action == "schedule") {
+      long minutes = meshJsonFieldInt(msg, "interval_minutes");
+      if (minutes > 0) {
+        ridScheduleActive = true;
+        ridScheduleIntervalMs = (unsigned long)minutes * 60000UL;
+        ridScheduleNextRunMs = millis();
+        Serial.println("Mesh: RID scan scheduled every " + String(minutes) + " min");
+      }
+    } else if (action == "unschedule") {
+      ridScheduleActive = false;
+      Serial.println("Mesh: RID scan schedule cleared");
+    }
+  }
+  // "radar" intentionally not handled here -- see the note at the top of
+  // this patch script.
+}
+
+void meshMqttReconnect() {
+  if (!meshModeEnabled || meshName.length() == 0 || meshServerAddr.length() == 0) {
+    meshServerConnected = false;
+    return;
+  }
+  if (meshMqttClient.connected()) {
+    meshServerConnected = true;
+    return;
+  }
+  meshServerConnected = false;
+
+  unsigned long now = millis();
+  if (now - meshLastReconnectAttemptMs < 5000) return;
+  meshLastReconnectAttemptMs = now;
+
+  meshMqttClient.setServer(meshServerAddr.c_str(), 1883);
+  meshMqttClient.setCallback(meshMqttCallback);
+  meshMqttClient.setBufferSize(2048);  // the #define alone doesn't reach PubSubClient.cpp's own build -- this does
+
+  String clientId = meshNodeId.length() > 0 ? meshNodeId : ("esp32c5-" + WiFi.macAddress());
+  String statusTopic = meshStatusTopic();
+
+  bool ok = meshMqttClient.connect(clientId.c_str(), meshName.c_str(), meshPassword.c_str(),
+                                    statusTopic.c_str(), 1, true, "offline");
+  if (ok) {
+    meshServerConnected = true;
+    meshMqttClient.publish(statusTopic.c_str(), "online", true);
+    meshMqttClient.publish(meshVersionTopic().c_str(), FIRMWARE_VERSION, true);
+    meshMqttClient.subscribe(meshCmdTopic().c_str());
+    Serial.println("Mesh: connected to MQTT server as " + clientId);
+  } else {
+    Serial.println("Mesh: MQTT connect failed, rc=" + String(meshMqttClient.state()));
+  }
+}
+
+void meshPublishTelemetryIfDue() {
+  static unsigned long lastMeshTelemetryMs = 0;
+  static String lastPublishedRidJson = "";
+  static String lastPublishedBleJson = "";
+  if (!meshModeEnabled || !meshServerConnected) return;
+  unsigned long now = millis();
+  if (now - lastMeshTelemetryMs < 5000) return;
+  lastMeshTelemetryMs = now;
+
+  // Check every tick (so a freshly-finished scan's real result is
+  // caught promptly -- bleScanTask() flips its running flag back to
+  // false at essentially the same moment it populates final results,
+  // so gating publish on that flag reliably missed it), but only
+  // actually publish when the content changed, so an unchanged result
+  // doesn't get republished forever once a scan finishes.
+  String ridJsonNow = ridBuildJson();
+  if (ridJsonNow != lastPublishedRidJson) {
+    meshMqttClient.publish(meshTelemetryTopic().c_str(), ridJsonNow.c_str());
+    lastPublishedRidJson = ridJsonNow;
+  }
+  if (bleScanDevicesJson != lastPublishedBleJson) {
+    meshMqttClient.publish(meshTelemetryTopic().c_str(), bleScanDevicesJson.c_str());
+    lastPublishedBleJson = bleScanDevicesJson;
+  }
+}
+
 void loop() {
   loopCounter++;
   {
@@ -4349,6 +4920,13 @@ void loop() {
 
   if (isApMode) dnsServer.processNextRequest();
   updateStatusLed();
+
+  if (!isApMode) {
+    meshMqttReconnect();
+    meshMqttClient.loop();
+    meshPublishTelemetryIfDue();
+    meshRunScheduledScansIfDue();
+  }
 
   if (connectedVia5g && !fellBackTo2g && !isApMode) {
     if (WiFi.status() == WL_CONNECTED) {
