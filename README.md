@@ -7,7 +7,7 @@ web UI — no app, no cloud, no companion server required.
 **Hardware:** Waveshare ESP32-C5-Zero (4MB flash, single-core 240MHz
 RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
-**Current version:** v1.19.0
+**Current version:** v2.12.1
 
 ---
 
@@ -55,6 +55,15 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
   manufacturer ID (phone, earbuds, fitness tracker, generic BLE board,
   etc.). Any device broadcasting a Remote ID signal (see below) is
   automatically labeled as a drone rather than guessed from its name.
+  Apple devices get extra detail where the signal supports it: AirPods
+  (and similar audio accessories) are called out specifically via their
+  Proximity Pairing broadcast, and Find My accessories (AirTags and
+  other trackers) are flagged via their Offline Finding broadcast — note
+  that signal is shared across AirTags, AirPods, and third-party
+  trackers, so it can't be narrowed to "AirTag" specifically from this
+  byte alone. Ordinary iPhones/iPads/Macs/Watches still show as a
+  generic "Apple device," since no documented signal distinguishes
+  between them during passive advertising.
 
 - **Radar** — tracks a single Bluetooth device's RSSI over time by MAC
   address, so you can walk around and use the changing signal strength
@@ -88,6 +97,20 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
   are alive, then optionally sweeps a specific TCP/UDP port across every
   host found.
 
+- **Packet Capture** — captures raw 802.11 (WiFi) traffic to a
+  standard-format `.pcap` file you can open in Wireshark, channel-hopping
+  across 1/6/11 while it runs. No UI tab yet — control it by hitting
+  these URLs directly from a browser or `curl`:
+  - `GET /pcapstart` — begin a capture (optionally `?mgmtonly=1` to
+    capture only management frames instead of all 802.11 traffic)
+  - `GET /pcapstop` — stop the current capture
+  - `GET /pcapstatus` — JSON status: whether it's active, management-
+    only mode, packet count, and bytes written
+  - `GET /pcapdownload` — download the captured file
+  
+  The status LED cycles fast blue/red while a capture is running (see
+  the LED reference below).
+
 - **TFTP Server** — upload files to the board's flash storage from your
   browser and delete them again; once you press **Start Daemon**, those
   files become downloadable to any TFTP client on the network over UDP
@@ -106,16 +129,29 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
 ---
 
+## Mesh networking (in development)
+
+A mesh networking system — multiple boards reporting into a central
+portal, with remote start/stop/scheduling of scans, a device registry,
+and more — is under active development and will be released separately
+once it's further along. The firmware in this repo already includes the
+mesh-client groundwork, but there's no public portal server to point it
+at yet, so mesh-dependent features (like scheduled recurring scans) aren't
+documented here until that piece ships.
+
+---
+
 ## Status LED reference
 
 | Pattern | Meaning |
 |---|---|
-| Green, double-blinks fast every 15s | Connected to your network on 2.4GHz |
-| Blue, double-blinks fast every 15s | Connected to your network on 5GHz |
+| Green, double-blinks Green fast every 15s | Connected to your network on 2.4GHz |
+| Green, double-blinks Blue fast every 15s | Connected to your network on 5GHz |
 | Fast green blink | WiFi Scan running |
 | Fast blue blink | BLE Scan or Radar running |
 | Fast purple blink | Drone Remote ID scan running |
 | Fast orange blink | Port Scan running |
+| Fast blue/red cycle (100ms each) | Packet Capture running |
 | Slow blue blink | In AP mode, no client connected yet |
 | Solid blue | In AP mode, a client is connected |
 
