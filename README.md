@@ -13,9 +13,8 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
 ## What's new in v2.19.0
 
-- **All mesh MQTT traffic is now encrypted end-to-end.** Every board
-  talking to a mesh portal does so over TLS — telemetry, commands, and
-  status/check-in messages are no longer sent in the clear.
+- **All mesh MQTT traffic is now encrypted end-to-end.** All telemetry
+  between the Portal is now secure and private.
 - **Numerous stability and bug-fix improvements** across the board's
   networking, scanning, and background-task handling since earlier
   v2.x releases. **If you have boards already deployed in the field —
