@@ -13,7 +13,7 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
 ## What's new in v2.19.0
 
-- **All mesh MQTT traffic is now encrypted end-to-end.** All Telemetry
+- **All mesh MQTT traffic is now encrypted end-to-end.** Telemetry
   Communication between the Portal and participating nodes is now
   secure and private.
 - **Numerous stability and bug-fix improvements** across the board's
