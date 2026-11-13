@@ -11,6 +11,7 @@
 #include <Preferences.h>
 #define MQTT_MAX_PACKET_SIZE 2048
 #include <PubSubClient.h>
+#include <WiFiClientSecure.h>
 #include <Adafruit_NeoPixel.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -27,7 +28,7 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
-#define FIRMWARE_VERSION "v2.12.1"
+#define FIRMWARE_VERSION "v2.19.0"
 
 // ---- RGB LED (WS2812 on GPIO27 - confirmed via color-cycle test) ----
 #define RGB_LED_PIN 27
@@ -55,7 +56,16 @@ String meshName = "";
 String meshPassword = "";
 String meshServerAddr = "";
 bool meshServerConnected = false;
-WiFiClient meshWifiClient;
+// TLS-PSK config for the MQTT connection -- must match the broker's
+// psk_file entry exactly (same identity string, same hex key). PSK skips
+// certificate parsing entirely, which is why it fits in the heap this
+// chip has free while running WiFi+BLE+SPIFFS+web server concurrently,
+// unlike the certificate-based TLS attempt that failed for pcap upload.
+const char* MESH_PSK_IDENTITY = "fortigill-mesh-node";
+const char* MESH_PSK_KEY_HEX = "cf6a15447cb07d02892119485475c4dc024977bba106011778166c4f750d9009";
+const int MESH_MQTT_TLS_PORT = 8883;
+
+WiFiClientSecure meshWifiClient;
 PubSubClient meshMqttClient(meshWifiClient);
 unsigned long meshLastReconnectAttemptMs = 0;
 String staticSubnet = "";
@@ -64,6 +74,12 @@ String staticDns1 = "";
 String staticDns2 = "";
 bool bleScanTaskRunning = false;
 String bleScanTaskResult = "";
+// Set once BLEDevice::init() has actually run -- see ensureBleInitialized().
+bool bleInitialized = false;
+// Forward declaration -- Arduino's auto-prototype generator missed this one
+// (it's defined much later in the file, near the other BLE task code, but
+// called from ridScanTask much earlier), so it's declared explicitly here.
+void maybeDeinitBle();
 String bleScanDevicesJson = "[]";
 
 #define BLE_GENERIC_MAX_DEVICES 40
@@ -224,6 +240,21 @@ bool looksLikeRepeater(const String &ssid) {
 
 // ---- Ping tool ----
 bool pingTaskRunning = false;
+// Set only when a ping is started by a mesh command (never by the local
+// web UI's /ping endpoint) -- meshPublishTelemetryIfDue() watches this and
+// publishes a result once the run finishes, then clears it.
+bool meshPingReportPending = false;
+// "Ping Health Monitor" -- a persistent background check, started/
+// stopped from the portal, pinging a fixed target every 15 minutes and
+// reporting over the same telemetry path as the one-shot ping command.
+// Lives in RAM only (same as the BLE/RID scan schedules -- not
+// persisted across reboot).
+bool pingHealthActive = false;
+String pingHealthTarget = "";
+// Default/fallback only -- ping_health_start overrides this from its
+// interval_minutes field (the portal's 1/5/15 min dropdown).
+unsigned long pingHealthIntervalMs = 15UL * 60UL * 1000UL;
+unsigned long pingHealthNextRunMs = 0;
 String pingTaskResult = "";
 String pingTargetInput = "";
 int pingTtlInput = 64;
@@ -285,7 +316,7 @@ static void onPingEnd(esp_ping_handle_t hdl, void *args) {
   pingSessionDone = true;
 }
 
-void pingTask(void *param) {
+void pingTaskImpl(void *param) {
   String target = pingTargetInput;
   int ttl = pingTtlInput;
   int size = pingSizeInput;
@@ -309,11 +340,7 @@ void pingTask(void *param) {
 
   int gaiErr = getaddrinfo(target.c_str(), NULL, &hint, &res);
   if (gaiErr != 0 || res == NULL) {
-    pingTaskResult = "Could not resolve \"" + target + "\".";
-    pingTaskRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    pingTaskResult = "Could not resolve \"" + target + "\".";  pingTaskRunning = false;  return;  }
   struct in_addr addr4 = ((struct sockaddr_in *)(res->ai_addr))->sin_addr;
   inet_addr_to_ip4addr(ip_2_ip4(&targetAddr), &addr4);
   IP_SET_TYPE_VAL(targetAddr, IPADDR_TYPE_V4);
@@ -341,11 +368,7 @@ void pingTask(void *param) {
 
   esp_ping_handle_t pingHdl;
   if (esp_ping_new_session(&config, &cbs, &pingHdl) != ESP_OK) {
-    pingTaskResult = "Failed to create ping session.";
-    pingTaskRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    pingTaskResult = "Failed to create ping session.";  pingTaskRunning = false;  return;  }
 
   esp_ping_start(pingHdl);
 
@@ -363,11 +386,7 @@ void pingTask(void *param) {
   esp_ping_stop(pingHdl);
   esp_ping_delete_session(pingHdl);
 
-  pingTaskRunning = false;
-  vTaskDelete(NULL);
-}
-
-String formatOneScanResult(int rank, wifi_ap_record_t *r) {
+  pingTaskRunning = false; }  void pingTask(void *param) {   pingTaskImpl(param);   vTaskDelete(NULL); }  String formatOneScanResult(int rank, wifi_ap_record_t *r) {
   String ssid = String((char *)r->ssid);
   if (ssid.length() == 0) ssid = "<hidden>";
   String band = (r->primary <= 14) ? "2.4GHz" : "5GHz";
@@ -392,7 +411,7 @@ String formatOneScanResult(int rank, wifi_ap_record_t *r) {
   return out;
 }
 
-void wifiScanTask(void *param) {
+void wifiScanTaskImpl(void *param) {
   bool is5g = (wifiScanRequestedBand == 1);
   String bandName = is5g ? "5GHz" : "2.4GHz";
   const int *channels = is5g ? CHANNELS_5G : CHANNELS_2G;
@@ -503,12 +522,7 @@ void wifiScanTask(void *param) {
   WiFi.setBandMode(WIFI_BAND_MODE_AUTO);
   Serial.println("Scan task: done.");
 
-  wifiScanTaskResult = result;
-  wifiScanTaskRunning = false;
-  vTaskDelete(NULL);
-}
-
-DNSServer dnsServer;
+  wifiScanTaskResult = result;  wifiScanTaskRunning = false; }  void wifiScanTask(void *param) {   wifiScanTaskImpl(param);   vTaskDelete(NULL); }  DNSServer dnsServer;
 bool isApMode = false;
 
 struct APClientInfo { uint8_t mac[6]; unsigned long connectedAt; bool used; };
@@ -900,7 +914,7 @@ String grabHttpServerHeader(IPAddress ip, uint16_t port, bool useTls, int timeou
   return response.substring(idx, lineEnd);
 }
 
-void portScanTask(void *param) {
+void portScanTaskImpl(void *param) {
   String target = portScanTargetInput;
   IPAddress ip;
   bool resolved = ip.fromString(target);
@@ -908,11 +922,7 @@ void portScanTask(void *param) {
     resolved = WiFi.hostByName(target.c_str(), ip) == 1;
   }
   if (!resolved) {
-    portScanResult = "Could not resolve target: " + target;
-    portScanRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    portScanResult = "Could not resolve target: " + target;  portScanRunning = false;  return;  }
 
   String result = "Target: " + target + "  (" + ip.toString() + ")\n";
 
@@ -991,11 +1001,7 @@ void portScanTask(void *param) {
     result += "\nOS guess: " + guessOsFromSignals(ttl, sawTtl, rdpOpen, smbOpen, sshOpen, banners) + "\n";
   }
 
-  portScanResult = result;
-  portScanRunning = false;
-  vTaskDelete(NULL);
-}
-// ===== END PORT SCAN TOOL =====
+  portScanResult = result;  portScanRunning = false; }  void portScanTask(void *param) {   portScanTaskImpl(param);   vTaskDelete(NULL); } // ===== END PORT SCAN TOOL =====
 
 // ===== SUBNET SWEEP TOOL (ARP discovery + port/protocol sweep) =====
 #include <lwip/netif.h>
@@ -1033,14 +1039,10 @@ struct netif *getStaNetif() {
   return (struct netif *)esp_netif_get_netif_impl(espNetif);
 }
 
-void arpSweepTask(void *param) {
+void arpSweepTaskImpl(void *param) {
   struct netif *nif = getStaNetif();
   if (!nif) {
-    arpSweepResult = "Could not get the Wi-Fi network interface - is the device connected to a network?";
-    arpSweepRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    arpSweepResult = "Could not get the Wi-Fi network interface - is the device connected to a network?";  arpSweepRunning = false;  return;  }
 
   uint32_t ipN = ipToUint32(WiFi.localIP());
   uint32_t maskN = ipToUint32(WiFi.subnetMask());
@@ -1106,18 +1108,9 @@ void arpSweepTask(void *param) {
     result += "  (none found - try again, some devices are slow to answer ARP)\n";
   }
 
-  arpSweepResult = result;
-  arpSweepRunning = false;
-  vTaskDelete(NULL);
-}
-
-void portSweepTask(void *param) {
+  arpSweepResult = result;  arpSweepRunning = false; }  void arpSweepTask(void *param) {   arpSweepTaskImpl(param);   vTaskDelete(NULL); }  void portSweepTaskImpl(void *param) {
   if (arpAliveCount == 0) {
-    portSweepResult = "No alive hosts cached - run a Subnet Sweep first.";
-    portSweepRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    portSweepResult = "No alive hosts cached - run a Subnet Sweep first.";  portSweepRunning = false;  return;  }
 
   String result = "Scanning " + String(arpAliveCount) + " alive host(s) for port " + String(portSweepPort) + "/" + (portSweepIsUdp ? "udp" : "tcp") + "...\n\n";
 
@@ -1151,11 +1144,7 @@ void portSweepTask(void *param) {
     result += "  (no hosts had that port open)\n";
   }
 
-  portSweepResult = result;
-  portSweepRunning = false;
-  vTaskDelete(NULL);
-}
-// ===== END SUBNET SWEEP TOOL =====
+  portSweepResult = result;  portSweepRunning = false; }  void portSweepTask(void *param) {   portSweepTaskImpl(param);   vTaskDelete(NULL); } // ===== END SUBNET SWEEP TOOL =====
 
 // ===== SYSTEM STATUS TOOL =====
 #include "driver/temperature_sensor.h"
@@ -1885,23 +1874,14 @@ void pcapCaptureTask(void *param) {
 }
 const int PCAP_UPLOAD_PORT = 8080;  // matches the portal's plain-HTTP device-upload listener (see run.sh)
 
-void pcapUploadTask(void *param) {
+void pcapUploadTaskImpl(void *param) {
   if (!meshModeEnabled || !meshServerConnected) {
-    Serial.println("Mesh: pcap upload requested but mesh is not connected");
-    vTaskDelete(NULL);
-    return;
-  }
+    Serial.println("Mesh: pcap upload requested but mesh is not connected");  return;  }
   if (!SPIFFS.exists(PCAP_FILE_PATH)) {
-    Serial.println("Mesh: pcap upload requested but no capture file exists");
-    vTaskDelete(NULL);
-    return;
-  }
+    Serial.println("Mesh: pcap upload requested but no capture file exists");  return;  }
   File f = SPIFFS.open(PCAP_FILE_PATH, "r");
   if (!f) {
-    Serial.println("Mesh: failed to open capture file for upload");
-    vTaskDelete(NULL);
-    return;
-  }
+    Serial.println("Mesh: failed to open capture file for upload");  return;  }
   size_t fileSize = f.size();
 
   WiFiClient client;  // plain HTTP -- see PCAP_UPLOAD_PORT comment above for why
@@ -1910,20 +1890,10 @@ void pcapUploadTask(void *param) {
                "/nodes/" + meshNodeId + "/pcap_upload";
   Serial.println("Mesh: uploading pcap (" + String(fileSize) + " bytes) to " + url);
   if (!http.begin(client, url)) {
-    Serial.println("Mesh: pcap upload http.begin() failed");
-    f.close();
-    vTaskDelete(NULL);
-    return;
-  }
+    Serial.println("Mesh: pcap upload http.begin() failed");  f.close();  return;  }
   http.addHeader("Content-Type", "application/vnd.tcpdump.pcap");
   int code = http.sendRequest("POST", &f, fileSize);
-  Serial.println("Mesh: pcap upload result code=" + String(code));
-  http.end();
-  f.close();
-  vTaskDelete(NULL);
-}
-
-bool startPcapCaptureIfIdle(bool mgmtOnly) {
+  Serial.println("Mesh: pcap upload result code=" + String(code));  http.end();  f.close(); }  void pcapUploadTask(void *param) {   pcapUploadTaskImpl(param);   vTaskDelete(NULL); }  bool startPcapCaptureIfIdle(bool mgmtOnly) {
   if (pcapCaptureActive) return false;
   if (ridScanActive) return false;
   pcapMgmtOnly = mgmtOnly;
@@ -1972,6 +1942,7 @@ void ridScanTask(void *param) {
   }
   ble_gap_disc_cancel();
   ridScanTaskHandle = NULL;
+  maybeDeinitBle();
   vTaskDelete(NULL);
 }
 // ===== END DRONE REMOTE ID SCANNER =====
@@ -2014,7 +1985,7 @@ table{color:var(--neon-dim);font-size:0.85rem;}
 th{color:var(--accent2);}
 </style></head><body>
 <h1>FortiGill ESP32-C5 Net Tools</h1>
-<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v2.12.1</div>
+<div style="font-size:0.75rem;color:var(--accent2);margin-top:-0.5rem;margin-bottom:0.8rem;">v2.19.0</div>
 <div id="netStatusBanner" style="margin-bottom:1rem;padding:0.6rem;border:1px solid var(--border);border-radius:6px;background:var(--bg2);font-size:0.9rem;">Loading network status...</div>
 <div class="tabs">
   <div class="tab active" data-panel="sysstatus">System Status</div>
@@ -3349,7 +3320,7 @@ static int bleGenericGapHandler(struct ble_gap_event *event, void *arg) {
   return 0;
 }
 
-void bleScanTask(void *param) {
+void bleScanTaskImpl(void *param) {
   bleGenericDeviceCount = 0;
 
   struct ble_gap_ext_disc_params bleGenParams = {};
@@ -3408,14 +3379,44 @@ void bleScanTask(void *param) {
 
   bleGenericDeviceCount = 0;
 
-  bleScanDevicesJson = devicesJson;
-  bleScanTaskResult = result;
-  bleScanTaskRunning = false;
-  Serial.println("BLE scan complete.");
-  vTaskDelete(NULL);
+  bleScanDevicesJson = devicesJson;  bleScanTaskResult = result;  bleScanTaskRunning = false;  Serial.println("BLE scan complete.");  maybeDeinitBle(); }  // NimBLE host sync state -- declared in host/ble_hs.h, which
+// BLEDevice.h's own include chain doesn't expose directly.
+#include <host/ble_hs.h>
+
+void ensureBleInitialized() {
+  if (!bleInitialized) {
+    BLEDevice::init("ESP32-C5 Net Tools");
+    // Wait for the NimBLE host stack to actually finish syncing,
+    // instead of guessing a fixed delay -- a flat delay(300) wasn't
+    // always enough under more heap pressure (e.g. right after a
+    // pcap capture), which let a BLE scan start before the host was
+    // really ready and silently find nothing despite rc=0. Polling
+    // the real flag returns as soon as it's actually done, and only
+    // waits longer when it genuinely needs to. 3s timeout so a
+    // genuine failure to sync doesn't hang forever.
+    unsigned long syncWaitStart = millis();
+    while (!ble_hs_synced() && millis() - syncWaitStart < 3000) {
+      delay(20);
+    }
+    if (!ble_hs_synced()) {
+      Serial.println("[BLE] WARNING: host stack did not sync within 3s");
+    }
+    bleInitialized = true;
+  }
 }
 
-static int radarGapHandler(struct ble_gap_event *event, void *arg) {
+// Give BLE's heap back once nothing BLE-related is active any more.
+// Safe to call from any of the three BLE-using tasks right as they
+// finish -- each one's own flag is already false by the time it gets
+// here, so this only actually deinits once ALL three are idle.
+void maybeDeinitBle() {
+  if (bleInitialized && !bleScanTaskRunning && !radarActive && !ridScanActive) {
+    BLEDevice::deinit(false);  // false = don't release_memory, so we can re-init later
+    bleInitialized = false;
+  }
+}
+
+void bleScanTask(void *param) {   bleScanTaskImpl(param);   vTaskDelete(NULL); }  static int radarGapHandler(struct ble_gap_event *event, void *arg) {
   if (event->type != BLE_GAP_EVENT_EXT_DISC) {
     return 0;
   }
@@ -3452,6 +3453,7 @@ void radarTask(void *param) {
     delay(200);
   }
   ble_gap_disc_cancel();
+  maybeDeinitBle();
   vTaskDelete(NULL);
 }
 
@@ -3577,7 +3579,7 @@ String reverseDnsLookup(IPAddress ip, int timeoutMs) {
   return hostname;
 }
 
-void traceTask(void *param) {
+void traceTaskImpl(void *param) {
   String target = traceTargetInput;
   int maxHops = traceMaxHopsInput;
   int timeoutMs = traceTimeoutInput;
@@ -3589,11 +3591,7 @@ void traceTask(void *param) {
 
   int gaierr = getaddrinfo(target.c_str(), NULL, &hint, &res);
   if (gaierr != 0 || res == NULL) {
-    traceTaskResult = "Could not resolve " + target;
-    traceTaskRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    traceTaskResult = "Could not resolve " + target;  traceTaskRunning = false;  return;  }
   struct in_addr destIn = ((struct sockaddr_in *)(res->ai_addr))->sin_addr;
   freeaddrinfo(res);
 
@@ -3604,11 +3602,7 @@ void traceTask(void *param) {
 
   int sock = socket(AF_INET, SOCK_RAW, IP_PROTO_ICMP);
   if (sock < 0) {
-    traceTaskResult = "Could not open a raw socket for traceroute.";
-    traceTaskRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    traceTaskResult = "Could not open a raw socket for traceroute.";  traceTaskRunning = false;  return;  }
 
   struct timeval tv;
   tv.tv_sec = timeoutMs / 1000;
@@ -3691,12 +3685,7 @@ void traceTask(void *param) {
   }
 
   close(sock);
-  traceTaskRunning = false;
-  Serial.println("Traceroute complete.");
-  vTaskDelete(NULL);
-}
-
-String dnsQuery(IPAddress dnsServer, const String &qname, uint16_t qtype, int timeoutMs) {
+  traceTaskRunning = false;  Serial.println("Traceroute complete."); }  void traceTask(void *param) {   traceTaskImpl(param);   vTaskDelete(NULL); }  String dnsQuery(IPAddress dnsServer, const String &qname, uint16_t qtype, int timeoutMs) {
   WiFiUDP udp;
   if (!udp.begin(0)) return "(could not open local UDP socket)\n";
 
@@ -3807,19 +3796,12 @@ String dnsQuery(IPAddress dnsServer, const String &qname, uint16_t qtype, int ti
   return result;
 }
 
-void dnsLookupTask(void *param) {
+void dnsLookupTaskImpl(void *param) {
   String target = dnsLookupInput;
   IPAddress dnsServer = WiFi.dnsIP(0);
 
   if (dnsServer[0] == 0 && dnsServer[1] == 0 && dnsServer[2] == 0 && dnsServer[3] == 0) {
-    dnsLookupResult = "No DNS server is configured on this device.";
-    dnsLookupRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
-
-  String result = "";
-  IPAddress asIp;
+    dnsLookupResult = "No DNS server is configured on this device.";  dnsLookupRunning = false;  return;  }  String result = "";  IPAddress asIp;
   if (asIp.fromString(target)) {
     String qname = String(asIp[3]) + "." + String(asIp[2]) + "." + String(asIp[1]) + "." + String(asIp[0]) + ".in-addr.arpa";
     result = "PTR (reverse) for " + target + ":\n" + dnsQuery(dnsServer, qname, 12, 1500);
@@ -3831,13 +3813,7 @@ void dnsLookupTask(void *param) {
     result += "TXT records for " + target + ":\n" + dnsQuery(dnsServer, target, 16, 1500) + "\n";
   }
 
-  dnsLookupResult = result;
-  dnsLookupRunning = false;
-  Serial.println("DNS lookup complete for " + target);
-  vTaskDelete(NULL);
-}
-
-String whoisQuery(const String &server, const String &target, int timeoutMs) {
+  dnsLookupResult = result;  dnsLookupRunning = false;  Serial.println("DNS lookup complete for " + target); }  void dnsLookupTask(void *param) {   dnsLookupTaskImpl(param);   vTaskDelete(NULL); }  String whoisQuery(const String &server, const String &target, int timeoutMs) {
   WiFiClient client;
   if (!client.connect(server.c_str(), 43, timeoutMs)) {
     return "";
@@ -3859,17 +3835,13 @@ String whoisQuery(const String &server, const String &target, int timeoutMs) {
   return response;
 }
 
-void whoisTask(void *param) {
+void whoisTaskImpl(void *param) {
   String target = whoisInput;
 
   Serial.println("Starting WHOIS for " + target);
   String iana = whoisQuery("whois.iana.org", target, 5000);
   if (iana.length() == 0) {
-    whoisTaskResult = "Could not reach whois.iana.org.";
-    whoisTaskRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    whoisTaskResult = "Could not reach whois.iana.org.";  whoisTaskRunning = false;  return;  }
 
   String referServer = "";
   int searchPos = 0;
@@ -3901,39 +3873,20 @@ void whoisTask(void *param) {
     result = iana;
   }
 
-  whoisTaskResult = result;
-  whoisTaskRunning = false;
-  Serial.println("WHOIS complete for " + target);
-  vTaskDelete(NULL);
-}
-
-void reverseDnsTask(void *param) {
+  whoisTaskResult = result;  whoisTaskRunning = false;  Serial.println("WHOIS complete for " + target); }  void whoisTask(void *param) {   whoisTaskImpl(param);   vTaskDelete(NULL); }  void reverseDnsTaskImpl(void *param) {
   String target = reverseDnsInput;
   IPAddress asIp;
   if (!asIp.fromString(target)) {
-    reverseDnsResult = "Enter a valid IP address for a reverse DNS lookup.";
-    reverseDnsRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    reverseDnsResult = "Enter a valid IP address for a reverse DNS lookup.";  reverseDnsRunning = false;  return;  }
 
   IPAddress dnsServer = WiFi.dnsIP(0);
   if (dnsServer[0] == 0 && dnsServer[1] == 0 && dnsServer[2] == 0 && dnsServer[3] == 0) {
-    reverseDnsResult = "No DNS server is configured on this device.";
-    reverseDnsRunning = false;
-    vTaskDelete(NULL);
-    return;
-  }
+    reverseDnsResult = "No DNS server is configured on this device.";  reverseDnsRunning = false;  return;  }
 
   String qname = String(asIp[3]) + "." + String(asIp[2]) + "." + String(asIp[1]) + "." + String(asIp[0]) + ".in-addr.arpa";
   String result = dnsQuery(dnsServer, qname, 12, 1500);
   reverseDnsResult = "PTR (reverse) for " + target + ":\n" + result;
-  reverseDnsRunning = false;
-  Serial.println("Reverse DNS complete for " + target);
-  vTaskDelete(NULL);
-}
-
-void setup() {
+  reverseDnsRunning = false;  Serial.println("Reverse DNS complete for " + target); }  void reverseDnsTask(void *param) {   reverseDnsTaskImpl(param);   vTaskDelete(NULL); }  void setup() {
   Serial.begin(115200);
   delay(1000);
 
@@ -3962,7 +3915,12 @@ void setup() {
   rgbLed.setPixelColor(0, rgbLed.Color(60, 0, 0));  // solid red: booting up
   rgbLed.show();
 
-  BLEDevice::init("ESP32-C5 Net Tools");
+  /* BLE init is now deferred -- see ensureBleInitialized() below.
+     It runs lazily the first time a BLE feature (BLE Scan, BLE
+     Radar, or Drone RID scan in BLE mode) is actually started,
+     instead of unconditionally at boot. Measured cost: ~44.7KB
+     free heap / ~36.9KB max-alloc -- headroom MQTT-TLS needs much
+     more right after boot than BLE does. */
 
   {
     temperature_sensor_config_t tempSensorConfig = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
@@ -4213,6 +4171,7 @@ void setup() {
         xTaskCreate(wifiRidScanTask, "wifiRidScanTask", 4096, NULL, 1, &ridScanTaskHandle);
       } else {
         ridScanMode = 0;
+        ensureBleInitialized();
         xTaskCreate(ridScanTask, "ridScanTask", 4096, NULL, 1, &ridScanTaskHandle);
       }
     }
@@ -4279,6 +4238,7 @@ void setup() {
     bleScanTaskRunning = true;
     bleScanTaskResult = "Scanning for BLE devices...";
     bleScanDevicesJson = "[]";
+    ensureBleInitialized();
     xTaskCreate(bleScanTask, "bleScanTask", 8192, NULL, 1, NULL);
     req->send(200, "text/plain", "BLE scan started.");
   });
@@ -4300,6 +4260,7 @@ void setup() {
     radarLastRssi = -127;
     radarLastSeenMs = 0;
     if (!radarActive) {
+      ensureBleInitialized();
       radarActive = true;
       xTaskCreate(radarTask, "radarTask", 8192, NULL, 1, NULL);
     }
@@ -4715,6 +4676,7 @@ String meshStatusTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "
 String meshCmdTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/cmd"; }
 String meshTelemetryTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/telemetry"; }
 String meshVersionTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/version"; }
+String meshUptimeTopic() { return "fortigill/" + meshName + "/" + meshNodeId + "/uptime"; }
 
 // Minimal flat-JSON string-field extractor -- looks for "key":"value" and
 // returns value. Good enough for our simple {"action":"...","tool":"..."}
@@ -4751,6 +4713,7 @@ void startBleScanIfIdle() {
     bleScanTaskRunning = true;
     bleScanTaskResult = "Scanning for BLE devices...";
     bleScanDevicesJson = "[]";
+    ensureBleInitialized();
     xTaskCreate(bleScanTask, "bleScanTask", 8192, NULL, 1, NULL);
   }
 }
@@ -4760,6 +4723,7 @@ void startRidScanIfIdle() {
     ridScanActive = true;
     ridDroneCount = 0;
     ridScanMode = 0;  // remote-triggered / scheduled starts default to BLE mode
+    ensureBleInitialized();
     xTaskCreate(ridScanTask, "ridScanTask", 4096, NULL, 1, &ridScanTaskHandle);
   }
 }
@@ -4768,6 +4732,28 @@ void startRidScanIfIdle() {
 // interval has elapsed, using the exact same start path as a manual
 // start, so scheduled runs behave identically and still publish over
 // mesh via the existing meshPublishTelemetryIfDue() change-detection.
+// Fires a Ping Health Monitor check every PING_HEALTH_INTERVAL_MS, reusing
+// the exact same pingTask()/meshPingReportPending path as the one-shot
+// mesh "ping" command -- the result reports over telemetry the same way,
+// no separate code or UI needed. Skips a tick (and tries again next time)
+// if a ping -- of either kind -- is already running.
+void meshRunPingHealthIfDue() {
+  if (!pingHealthActive || pingTaskRunning) return;
+  unsigned long now = millis();
+  if ((long)(now - pingHealthNextRunMs) < 0) return;
+  pingHealthNextRunMs = now + pingHealthIntervalMs;
+  pingTargetInput = pingHealthTarget;
+  pingTtlInput = 64;
+  pingSizeInput = 64;
+  pingContinuousMode = false;
+  pingStopRequested = false;
+  pingTaskResult = "Starting...";
+  pingTaskRunning = true;
+  meshPingReportPending = true;
+  xTaskCreate(pingTask, "pingTask", 4096, NULL, 1, NULL);
+  Serial.println("Mesh: Ping Health Monitor check -> " + pingHealthTarget);
+}
+
 void meshRunScheduledScansIfDue() {
   if (!meshModeEnabled || !meshServerConnected) return;
   unsigned long now = millis();
@@ -4804,6 +4790,49 @@ void meshMqttCallback(char* topic, byte* payload, unsigned int length) {
   if (action == "pcap_stop") {
     stopPcapCapture();
     Serial.println("Mesh: packet capture stop requested");
+    return;
+  }
+
+  if (action == "ping") {
+    String target = meshJsonField(msg, "target");
+    if (pingTaskRunning) {
+      Serial.println("Mesh: ping request ignored (a ping is already running)");
+    } else if (target.length() == 0) {
+      Serial.println("Mesh: ping request ignored (no target given)");
+    } else {
+      pingTargetInput = target;
+      pingTtlInput = 64;
+      pingSizeInput = 64;
+      pingContinuousMode = false;  // mesh-triggered pings are always a fixed run of 5
+      pingStopRequested = false;
+      pingTaskResult = "Starting...";
+      pingTaskRunning = true;
+      meshPingReportPending = true;
+      xTaskCreate(pingTask, "pingTask", 4096, NULL, 1, NULL);
+      Serial.println("Mesh: ping started -> " + target);
+    }
+    return;
+  }
+
+  if (action == "ping_health_start") {
+    String target = meshJsonField(msg, "target");
+    long intervalMinutes = meshJsonFieldInt(msg, "interval_minutes");
+    if (target.length() == 0) {
+      Serial.println("Mesh: ping_health_start ignored (no target given)");
+    } else {
+      pingHealthTarget = target;
+      pingHealthIntervalMs = (intervalMinutes > 0 ? (unsigned long)intervalMinutes : 15UL) * 60UL * 1000UL;
+      pingHealthActive = true;
+      pingHealthNextRunMs = millis();  // first check runs right away
+      Serial.println("Mesh: Ping Health Monitor started -> " + target +
+                      " every " + String(pingHealthIntervalMs / 60000UL) + " min");
+    }
+    return;
+  }
+
+  if (action == "ping_health_stop") {
+    pingHealthActive = false;
+    Serial.println("Mesh: Ping Health Monitor stopped");
     return;
   }
 
@@ -4861,7 +4890,10 @@ void meshMqttReconnect() {
   if (now - meshLastReconnectAttemptMs < 5000) return;
   meshLastReconnectAttemptMs = now;
 
-  meshMqttClient.setServer(meshServerAddr.c_str(), 1883);
+  meshWifiClient.setPreSharedKey(MESH_PSK_IDENTITY, MESH_PSK_KEY_HEX);
+  Serial.println("Mesh: pre-MQTT-TLS free heap=" + String(ESP.getFreeHeap()) +
+                  " maxAlloc=" + String(ESP.getMaxAllocHeap()));
+  meshMqttClient.setServer(meshServerAddr.c_str(), MESH_MQTT_TLS_PORT);
   meshMqttClient.setCallback(meshMqttCallback);
   meshMqttClient.setBufferSize(2048);  // the #define alone doesn't reach PubSubClient.cpp's own build -- this does
 
@@ -4874,19 +4906,60 @@ void meshMqttReconnect() {
     meshServerConnected = true;
     meshMqttClient.publish(statusTopic.c_str(), "online", true);
     meshMqttClient.publish(meshVersionTopic().c_str(), FIRMWARE_VERSION, true);
+    // Retained uptime baseline -- right after connect, millis() is close
+    // to this boot's true age, so the portal can compute boot_time =
+    // (now - this value) immediately rather than waiting for the next
+    // periodic uptime publish in meshPublishTelemetryIfDue().
+    meshMqttClient.publish(meshUptimeTopic().c_str(), String(millis() / 1000).c_str(), true);
     meshMqttClient.subscribe(meshCmdTopic().c_str());
     Serial.println("Mesh: connected to MQTT server as " + clientId);
   } else {
     Serial.println("Mesh: MQTT connect failed, rc=" + String(meshMqttClient.state()));
+    meshWifiClient.stop();  /* force-release any partially-allocated TLS state before the next retry */
   }
 }
 
 void meshPublishTelemetryIfDue() {
   static unsigned long lastMeshTelemetryMs = 0;
+  static unsigned long lastMeshUptimeMs = 0;
   static String lastPublishedRidJson = "";
   static String lastPublishedBleJson = "";
   if (!meshModeEnabled || !meshServerConnected) return;
   unsigned long now = millis();
+
+  // Report a finished mesh-triggered ping -- checked every tick (not
+  // gated by the 5s/60s timers below) so the result goes out promptly,
+  // same reasoning as the BLE/RID "catch it the moment it finishes"
+  // check further down. pingReceivedCount/pingMinMs/pingMaxMs/pingSumMs
+  // are the existing ping tool's own globals, already populated by
+  // onPingSuccess/onPingEnd by the time pingTaskRunning goes false.
+  if (meshPingReportPending && !pingTaskRunning) {
+    meshPingReportPending = false;
+    int received = (int)pingReceivedCount;
+    float lossPct = 100.0f * (float)(5 - received) / 5.0f;
+    float avgMs = (received > 0) ? ((float)pingSumMs / (float)received) : 0.0f;
+    uint32_t minMs = (received > 0) ? pingMinMs : 0;
+    uint32_t maxMs = (received > 0) ? pingMaxMs : 0;
+    String pingReportJson = "{\"type\":\"ping_result\",\"target\":\"" + pingTargetInput + "\"," +
+      "\"sent\":5,\"received\":" + String(received) + "," +
+      "\"loss_pct\":" + String(lossPct, 1) + "," +
+      "\"min_ms\":" + String(minMs) + "," +
+      "\"max_ms\":" + String(maxMs) + "," +
+      "\"avg_ms\":" + String(avgMs, 1) + "}";
+    meshMqttClient.publish(meshTelemetryTopic().c_str(), pingReportJson.c_str());
+    Serial.println("Mesh: published ping result -> " + pingReportJson);
+  }
+
+  // Uptime gets its own slower cadence (60s), independent of the 5s
+  // telemetry gate below -- minute-level freshness is plenty for an
+  // uptime display, and this avoids 12x the MQTT traffic a 5s cadence
+  // would cost for no real benefit. Checked before the early return so
+  // it doesn't get stuck on the telemetry gate's own timing.
+  if (now - lastMeshUptimeMs >= 60000) {
+    lastMeshUptimeMs = now;
+    meshMqttClient.publish(meshUptimeTopic().c_str(), String(now / 1000).c_str(), true);
+  }
+
   if (now - lastMeshTelemetryMs < 5000) return;
   lastMeshTelemetryMs = now;
 
@@ -4905,6 +4978,36 @@ void meshPublishTelemetryIfDue() {
     meshMqttClient.publish(meshTelemetryTopic().c_str(), bleScanDevicesJson.c_str());
     lastPublishedBleJson = bleScanDevicesJson;
   }
+}
+
+void meshCheckinTaskImpl(void *param) {
+  WiFiClient client;  // plain HTTP, same device-facing port as pcap uploads
+  HTTPClient http;
+  String url = "http://" + meshServerAddr + ":" + String(PCAP_UPLOAD_PORT) +
+               "/nodes/" + meshNodeId + "/checkin";
+  if (http.begin(client, url)) {
+    http.addHeader("Content-Type", "application/json");
+    String band = connectedVia5g ? "5GHz" : "2.4GHz";
+    String body = "{\"local_ip\":\"" + WiFi.localIP().toString() + "\",\"wifi_band\":\"" + band + "\"}";
+    int code = http.POST(body);
+    http.end();
+    if (code != 200) {
+      Serial.println("Mesh: checkin failed, code=" + String(code));
+    }
+  }
+}
+
+void meshCheckinTask(void *param) {
+  meshCheckinTaskImpl(param);
+  vTaskDelete(NULL);
+}
+
+void meshCheckinIfDue() {
+  static unsigned long nextCheckinMs = 0;
+  if (!meshModeEnabled || !meshServerConnected) return;
+  if (millis() < nextCheckinMs) return;
+  nextCheckinMs = millis() + 60000UL;  // every 60s
+  xTaskCreate(meshCheckinTask, "meshCheckinTask", 6144, NULL, 1, NULL);
 }
 
 void loop() {
@@ -4926,6 +5029,8 @@ void loop() {
     meshMqttClient.loop();
     meshPublishTelemetryIfDue();
     meshRunScheduledScansIfDue();
+    meshRunPingHealthIfDue();
+    meshCheckinIfDue();
   }
 
   if (connectedVia5g && !fellBackTo2g && !isApMode) {
