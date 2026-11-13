@@ -7,7 +7,27 @@ web UI — no app, no cloud, no companion server required.
 **Hardware:** Waveshare ESP32-C5-Zero (4MB flash, single-core 240MHz
 RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 
-**Current version:** v2.12.1
+**Current version:** v2.19.0
+
+---
+
+## What's new in v2.19.0
+
+- **All mesh MQTT traffic is now encrypted end-to-end.** Every board
+  talking to a mesh portal does so over TLS — telemetry, commands, and
+  status/check-in messages are no longer sent in the clear.
+- **Numerous stability and bug-fix improvements** across the board's
+  networking, scanning, and background-task handling since earlier
+  v2.x releases. **If you have boards already deployed in the field —
+  even ones with no mesh/portal plans at all — it's strongly
+  recommended you update them to v2.19.0.** A number of the fixes in
+  this range address real stability issues seen in earlier builds, not
+  just mesh-related behavior.
+- The mesh/portal side of the project (a central dashboard for
+  managing multiple boards) is in **continuing active development**.
+  It's not public yet, but it's come a long way and we're working hard
+  toward an exciting upcoming release. More on that once it's ready to
+  share.
 
 ---
 
@@ -134,7 +154,11 @@ RISC-V + LP core, dual-band WiFi 6, Bluetooth 5 / BLE)
 A mesh networking system — multiple boards reporting into a central
 portal, with remote start/stop/scheduling of scans, a device registry,
 and more — is under active development and will be released separately
-once it's further along. The firmware in this repo already includes the
+once it's further along. All mesh MQTT traffic (telemetry, commands,
+check-ins) is encrypted end-to-end over TLS. The portal/dashboard side
+is coming along well and under continuing active development, with an
+exciting upcoming release on the way — details on that will follow once
+it's ready to share. The firmware in this repo already includes the
 mesh-client groundwork, but there's no public portal server to point it
 at yet, so mesh-dependent features (like scheduled recurring scans) aren't
 documented here until that piece ships.
